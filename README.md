@@ -28,7 +28,6 @@ To install the logger package, run:
 package main
 import (
     "github.com/ninepeach/go-logger"
-    "os"
 )
 func main() {
     // Create a standard logger that outputs to stderr with timestamp, debug, and trace enabled

@@ -27,7 +27,7 @@ To install the logger package, run:
 ```go
 package main
 import (
-    "github.com/github.com/go-logger"
+    "github.com/ninepeach/go-logger"
     "os"
 )
 func main() {

@@ -88,6 +88,11 @@ func (l *SysLogger) Warnf(format string, v ...interface{}) {
     l.logf(l.writer.Warning, format, v...)
 }
 
+// Fatalf logs a fatal error
+func (l *SysLogger) Fatalf(format string, v ...any) {
+	l.writer.Crit(fmt.Sprintf(format, v...))
+}
+
 // Errorf logs an error message.
 func (l *SysLogger) Errorf(format string, v ...interface{}) {
     l.logf(l.writer.Err, format, v...)

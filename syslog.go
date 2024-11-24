@@ -90,7 +90,7 @@ func (l *SysLogger) Warnf(format string, v ...interface{}) {
 
 // Fatalf logs a fatal error
 func (l *SysLogger) Fatalf(format string, v ...any) {
-	l.writer.Crit(fmt.Sprintf(format, v...))
+    l.logf(l.writer.Crit, format, v...)
 }
 
 // Errorf logs an error message.

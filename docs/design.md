@@ -788,44 +788,50 @@ and error maps to warning (4); error and above maps to error (3). Slog never
 maps to fatal/critical merely because its numeric level is high. Priority is
 `facility*8 + severity`.
 
-For UDP and TCP, `Address` is required. `DialTimeout` and
-`WriteTimeout` MUST be non-negative. Zero means a finite default of 5 seconds
-for each. DialTimeout bounds connection establishment; WriteTimeout applies
-to **each complete message**, not each individual socket write. Set the
-connection write deadline once before sending the frame/datagram. Local Syslog ignores both timeout fields only when they are zero; any non-zero
-`DialTimeout` or `WriteTimeout` for local transport MUST be rejected with
-`ErrInvalidConfig`, because V2 makes no deadline guarantee for local syslog.
-The zero values still select 5-second defaults for UDP/TCP only. The local
-implementation MUST NOT claim bounded writes.
+For UDP and TCP, `Address` is required. Both timeout fields MUST be
+non-negative. Zero `DialTimeout` selects 1 second; zero `WriteTimeout` selects
+5 seconds. `DialTimeout` bounds each remote or local socket dial. The effective
+`WriteTimeout` applies to each complete message, not each socket write: set
+one deadline before sending a frame or datagram, including on `net.UnixConn`.
+Local Unix sockets MUST enforce `SetWriteDeadline`; unsupported endpoints
+MUST fail construction rather than silently promise bounded writes. A timeout
+is a transport failure for TCP and local stream sockets. The synchronous
+dial holds the writer mutex and can block all concurrent `Write` and `Close`
+calls for up to `DialTimeout`; this is an accepted synchronous design cost.
 
-A remote connection is opened by the constructor and protected by a mutex.
-Remote writer states are `CONNECTED`, `DISCONNECTED`, and `CLOSED`.
-`CONNECTED` owns a usable socket; `DISCONNECTED` owns none and may attempt
-reconnection; `CLOSED` is terminal. A failed initial dial returns an error
-and no writer. A TCP transport failure (including timeout or partial frame)
-closes the socket and enters `DISCONNECTED`; the failed record is never
-replayed. A UDP transport error indicating loss of the socket enters
-`DISCONNECTED`, but a record-local datagram error such as `EMSGSIZE` MUST
-NOT disconnect a usable socket. UDP success means only local acceptance.
+Construction opens the selected transport; initial dial failure returns an
+error and no writer (applications needing startup tolerance must retry
+construction). All transports use the mutex-protected `CONNECTED`,
+`DISCONNECTED`, and `CLOSED` states. `CONNECTED` owns a socket;
+`DISCONNECTED` owns none; `CLOSED` is terminal. Any error that transitions
+to `DISCONNECTED` MUST wrap `ErrSyslogUnavailable` and the underlying cause,
+including the first connected-socket failure and failures after reconnection.
+Record-local failures, including UDP `EMSGSIZE`, MUST NOT wrap
+`ErrSyslogUnavailable` and MUST preserve `CONNECTED`. No failed record is
+replayed, including a partially sent TCP or local stream frame.
 
-Reconnection is synchronous and occurs only on a subsequent non-empty `Write`.
-At most one dial is attempted per eligible call while holding the writer mutex;
-there is no background goroutine, queue, or retry of a failed record. A failed
-dial starts a fixed 60-second monotonic backoff, measured from its completion.
-The first write after a connected socket fails also starts that backoff, so
-immediate subsequent calls cannot busy-loop. While backoff is active, `Write`
-returns `(0, ErrSyslogUnavailable)` without dialing. When eligible, `Write`
-attempts a bounded dial using `DialTimeout`; if successful, it sends only the
-current record and transitions to `CONNECTED`. Dial failure returns an error
-wrapping `ErrSyslogUnavailable` and its underlying cause. Tests MUST use an
-internal monotonic clock hook; no public retry option is added. `Close` from
-any state enters `CLOSED`, is idempotent, and prevents reconnecting.
-TCP uses RFC 6587 octet-counting framing; UDP sends one RFC 5424 message per
-datagram.
+A connected transport failure enters `DISCONNECTED` with one immediate
+reconnect opportunity on the next non-empty `Write`; the failed record is not
+retried. Only a failed reconnect dial or a failed send after a successful
+reconnect starts a fixed 60-second monotonic backoff, measured after that
+failure. At most one dial occurs per eligible call, synchronously under the
+writer mutex. During backoff, `Write` returns `(0, ErrSyslogUnavailable)`
+without dialing. When eligible, dial first, then send only the current record;
+transition to `CONNECTED` only after a successful send. If dial succeeds but
+send fails with a transport error, discard the new socket, remain
+`DISCONNECTED`, restart backoff, and return an error wrapping
+`ErrSyslogUnavailable` and the send cause. A record-local UDP send error after
+reconnect preserves the usable socket and enters `CONNECTED` even though the
+record returns its own error. No background goroutine, queue, or public retry
+option is provided. Tests use an internal monotonic clock hook. `Close` from
+any state is idempotent, enters `CLOSED`, and prevents reconnection.
+Remote TCP uses RFC 6587 octet-counting; remote UDP sends one RFC 5424
+message per datagram.
 
 The RFC 5424 wire message is exactly:
 `<PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG`.
-TIMESTAMP is the event time in UTC RFC3339 format; HOSTNAME is
+TIMESTAMP is the event time in UTC RFC3339 format; direct `Write` (which
+has no event time) uses a single `time.Now()` captured for that call. HOSTNAME is
 `os.Hostname()` or `-` on failure; APP-NAME is validated Tag (max 48
 printable non-space ASCII bytes); PROCID is the decimal `os.Getpid()`;
 MSGID and STRUCTURED-DATA are both `-`. The message body is the selected
@@ -836,23 +842,34 @@ fields into RFC 5424 STRUCTURED-DATA. For TCP, prefix the byte length of the
 entire RFC 5424 message, followed by one ASCII space; the length excludes the
 prefix itself.
 
-Local Syslog uses the platform's native local syslog interface and framing,
-not necessarily RFC 5424. On supported Unix systems, it MUST use the native
-syslog protocol accepted by the platform endpoint (typically BSD/RFC 3164-like
-framing) and MUST NOT prepend RFC 5424 version `1` unless the selected local
-endpoint explicitly requires it. Platform-specific behavior MUST be verified
-on Linux and macOS; no RFC 5424 wire-format guarantee is made for local.
+Local Syslog uses Unix sockets and the same connection state machine. On
+Linux/macOS, attempt `/dev/log`, `/var/run/syslog`, then `/var/run/log`, in
+that order, trying `unixgram` then `unix` stream for each path. The first
+successful dial selects the endpoint; reconnect repeats discovery. Emit
+`<PRI>TIMESTAMP TAG[PID]: MSG`, with TIMESTAMP formatted as Go's
+`time.Stamp` in local time, TAG as the validated Tag, and PID from
+`os.Getpid()`; no hostname or RFC 5424 version prefix. Unix stream messages
+MUST end in one newline delimiter; unixgram sends one complete message per
+datagram without that delimiter. The implementation MUST NOT delegate writes
+to `log/syslog`, whose retry/replay behavior conflicts with this contract.
+Linux and macOS native endpoint/framing tests are required. macOS unified
+logging may keep info only in memory and omit persistence of debug by default;
+local socket acceptance does not guarantee persistence.
 On Windows it returns `ErrSyslogLocalUnsupported`.
 Address must be empty for local and non-empty for UDP/TCP. An empty Tag
 defaults to the executable base name, then undergoes the same validation.
 
-A TCP frame write loops over partial writes until the complete frame is
-accepted or a failure occurs. A partial or failed TCP frame is not replayed;
-its socket is discarded as described above. UDP `EMSGSIZE` and equivalent
-record-local oversized-datagram failures return an error for that record only
-and retain `CONNECTED`. Other UDP errors MUST be classified as either
-record-local (preserve socket) or transport failure (disconnect); unrecognized
-transport errors conservatively disconnect. Direct `Write` returns `len(p)`
+A TCP or local stream frame write loops over partial writes until the full
+frame is accepted or a failure occurs. A partial or failed stream frame is
+not replayed. Before sending remote UDP, reject an RFC 5424 datagram whose
+payload exceeds 65,507 bytes with a record-local size error; this IPv4 bound
+is only a maximum, not a guarantee of platform acceptance (macOS may impose
+much smaller limits). UDP `EMSGSIZE`, `ECONNREFUSED` (ICMP unreachable),
+`ENOBUFS`, `EHOSTUNREACH`, `ENETUNREACH`, and Windows `WSAECONNRESET` are
+record-local errors that preserve `CONNECTED`. Only positively identified
+invalid/closed-socket errors (such as `net.ErrClosed` or `EBADF`) transition
+UDP to `DISCONNECTED`; unknown UDP errors remain record-local. Platform
+error matching MUST use `errors.Is` or equivalent wrapped OS error handling. Direct `Write` returns `len(p)`
 only on complete frame/datagram acceptance and returns `(0, error)` on any
 framing/transport failure, even if a TCP prefix was partially sent. This is
 a record-level contract, not a claim that no bytes reached the network.
@@ -868,8 +885,9 @@ l, err := logger.New(sw, logger.WithFormat(logger.JSONFormat))
 sl := slog.New(logger.NewSlogHandler(l))
 ```
 
-Network, encoding, and close errors are never swallowed. There is no buffer,
-backoff, retry loop, or delivery guarantee.
+Network, encoding, and close errors are never swallowed. There is no queue,
+record replay, background retry loop, or delivery guarantee; synchronous
+reconnect and bounded backoff follow the state machine above.
 
 ## 12. Cross-platform constraints
 
@@ -966,12 +984,15 @@ interfaces or test-only hooks, not exported production APIs.
   ordinary error values, and record time;
 - Syslog priority/facility mapping including custom slog levels below trace,
   exact RFC 5424 UDP/RFC 6587 TCP framing;
-- local Linux/macOS native framing, Windows unsupported builds, local
-  non-zero timeout rejection, UDP/TCP 5-second defaults, bounded deadlines;
-- CONNECTED/DISCONNECTED/CLOSED transitions, failed initial dial, TCP partial
-  frame/timeout, no replay, reconnect success/failure, 60-second monotonic
-  backoff with internal hook, concurrent Write/Close and terminal Close;
-- UDP EMSGSIZE preserves CONNECTED, other datagram vs transport errors,
+- local Linux/macOS endpoint discovery and native datagram/stream framing,
+  Windows unsupported builds, local write deadlines, remote dial default 1s,
+  write default 5s, bounded deadlines and direct-Write timestamp;
+- CONNECTED/DISCONNECTED/CLOSED for local and remote, failed initial dial,
+  first disconnect errors.Is(ErrSyslogUnavailable), immediate reconnect,
+  reconnect-send failure, no replay, 60-second monotonic backoff with hook,
+  mutex-held dial blocking, concurrent Write/Close and terminal Close;
+- UDP size precheck, EMSGSIZE/ECONNREFUSED/ENOBUFS and routing errors
+  preserve CONNECTED, invalid socket disconnects, unknown errors stay local,
   newline injection defense and record-level write counts.
 
 The following must pass:

@@ -806,8 +806,16 @@ construction). All transports use the mutex-protected `CONNECTED`,
 to `DISCONNECTED` MUST wrap `ErrSyslogUnavailable` and the underlying cause,
 including the first connected-socket failure and failures after reconnection.
 A failed stream send that invalidates the connection wraps
-`ErrSyslogUnavailable`. No failed record is replayed, including a partially
-sent TCP or local stream frame.
+`ErrSyslogUnavailable`. For local `unixgram`, `EMSGSIZE`, `ENOBUFS`, and
+write-deadline timeout are record-local failures: return the underlying error
+without `ErrSyslogUnavailable` and preserve `CONNECTED`. `ECONNREFUSED`,
+`ENOENT`, `net.ErrClosed`, and `EBADF` indicate an unavailable local endpoint
+and transition to `DISCONNECTED`, wrapping `ErrSyslogUnavailable`. Other
+`unixgram` errors preserve `CONNECTED` unless the socket is demonstrably
+invalid. The same classification applies to a send after reconnection; a
+record-local failure leaves the newly connected socket in `CONNECTED` without
+starting backoff. No failed record is replayed, including a partially sent
+TCP or local stream frame.
 
 A connected transport failure enters `DISCONNECTED` with one immediate
 reconnect opportunity on the next non-empty `Write`; the failed record is not
@@ -834,15 +842,22 @@ has no event time) uses a single `time.Now()` captured for that call. HOSTNAME i
 printable non-space ASCII bytes); PROCID is the decimal `os.Getpid()`;
 MSGID and STRUCTURED-DATA are both `-`. The message body is the selected
 JSON or Console encoded record, without its trailing newline, encoded as UTF-8
-with **no BOM**. The message's embedded newlines and carriage returns are
-escaped as literal `\\n` and `\\r`. The library does not map user
+with **no BOM**. Before framing on ANY Syslog transport (TCP, local unixgram, or local Unix
+stream), the message body MUST escape embedded LF and CR as literal `\\n`
+and `\\r`. Only the single trailing input LF is removed first; framing
+separators are added afterward. This also applies to direct `Write`, so a
+caller-supplied multiline message cannot inject a second local stream record.
+The library does not map user
 fields into RFC 5424 STRUCTURED-DATA. For TCP, prefix the byte length of the
 entire RFC 5424 message, followed by one ASCII space; the length excludes the
 prefix itself.
 
-Local Syslog uses Unix sockets and the same connection state machine. On
-Linux/macOS, attempt `/dev/log`, `/var/run/syslog`, then `/var/run/log`, in
-that order, trying `unixgram` then `unix` stream for each path. The first
+Local Syslog uses Unix sockets and the same connection state machine. If
+`SyslogConfig.Address` is non-empty in local mode, it is an explicit Unix
+socket filesystem path: try `unixgram` then `unix` stream at that path only,
+without fallback to other paths. If empty, on Linux/macOS attempt `/dev/log`,
+`/var/run/syslog`, then `/var/run/log`, in that order, trying `unixgram` then
+`unix` stream for each path. The first
 successful dial selects the endpoint; reconnect repeats discovery. Emit
 `<PRI>TIMESTAMP TAG[PID]: MSG`, with TIMESTAMP formatted as Go's
 `time.Stamp` in local time, TAG as the validated Tag, and PID from
@@ -854,7 +869,9 @@ Linux and macOS native endpoint/framing tests are required. macOS unified
 logging may keep info only in memory and omit persistence of debug by default;
 local socket acceptance does not guarantee persistence.
 On Windows it returns `ErrSyslogLocalUnsupported`.
-Address must be empty for local and non-empty for TCP. An empty Tag
+Address is optional for local (explicit Unix socket path) and required for
+TCP. The local Address MUST be a filesystem socket path, not a `unix://` URI;
+applications migrating from V1 MUST remove the scheme prefix. An empty Tag
 defaults to the executable base name, then undergoes the same validation.
 
 A TCP or local stream frame write loops over partial writes until the full
@@ -974,15 +991,19 @@ interfaces or test-only hooks, not exported production APIs.
   ordinary error values, and record time;
 - Syslog priority/facility mapping including custom slog levels below trace,
   exact RFC 5424 over RFC 6587 TCP framing; reject IP UDP config;
-- local Linux/macOS endpoint discovery and native datagram/stream framing,
-  Windows unsupported builds, local write deadlines, remote dial default 1s,
-  write default 5s, bounded deadlines and direct-Write timestamp;
+- local Linux/macOS endpoint discovery, explicit local socket paths,
+  native datagram/stream framing, Windows unsupported builds, local write
+  deadlines, remote dial default 1s, write default 5s, bounded deadlines
+  and direct-Write timestamp;
 - CONNECTED/DISCONNECTED/CLOSED for local and remote, failed initial dial,
   first disconnect errors.Is(ErrSyslogUnavailable), immediate reconnect,
   reconnect-send failure, no replay, 60-second monotonic backoff with hook,
   mutex-held dial blocking, concurrent Write/Close and terminal Close;
 - no IP UDP API or transport, reject `SyslogNetwork("udp")` with
-  `ErrInvalidConfig`; newline injection defense and record-level write counts.
+  `ErrInvalidConfig`; local unixgram EMSGSIZE/ENOBUFS/timeout preserve
+  CONNECTED, ECONNREFUSED/ENOENT disconnect, reconnect-send classification;
+  direct-Write CR/LF injection defense for TCP/unixgram/Unix stream, and
+  record-level write counts.
 
 The following must pass:
 
@@ -1019,7 +1040,10 @@ V2 is acceptable only when all of the following are true:
 9. Benchmarks and their environment are recorded for review; optimization has
    not weakened correctness.
 10. README, migration guide, and V2 examples are updated before tagging
-    `v2.0.0`.
+    `v2.0.0`. The migration guide MUST explicitly document V1 `udp://`
+    removal (no IP UDP Syslog in V2), conversion of V1 `unix://path` into
+    `SyslogLocal` with `Address: "path"` (custom paths remain supported),
+    and the breaking change that V2 `Fatal` logs without exiting.
 
 ## 16. Implementation guardrails
 

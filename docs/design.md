@@ -340,8 +340,10 @@ private mutex and does not call this package recursively. It MUST emit at most
 one diagnostic per one-second interval, using monotonic elapsed time, and count
 suppressed errors. The next emitted diagnostic MUST include the number of
 errors suppressed since the previous emission; suppressed errors do not invoke
-additional output. The rate-limit state is shared by loggers using the same
-default handler, and is safe for concurrent calls. Failure of the fallback
+additional output. The rate-limit state is package-level shared runtime state, not mutable global
+configuration, and is safe for concurrent calls. Because no background worker
+flushes the count, suppressed errors at the end of a burst may never be
+reported; this is an accepted tradeoff. Failure of the fallback
 write is ignored because there is no further safe reporting channel.
 
 The package exposes sentinel errors usable with `errors.Is`:
@@ -350,7 +352,7 @@ The package exposes sentinel errors usable with `errors.Is`:
 var (
     ErrInvalidConfig = errors.New("logger: invalid configuration")
     ErrFieldEncoding = errors.New("logger: field encoding degraded")
-    ErrEventConsumed = errors.New("logger: event already submitted")
+    ErrEventConsumed = errors.New("logger: already consumed")
     ErrNilLogger     = errors.New("logger: nil logger")
     ErrClosed        = errors.New("logger: writer closed")
     ErrSyslogLocalUnsupported = errors.New("logger: local syslog unsupported")
@@ -778,21 +780,48 @@ removed before Syslog framing.
 
 Facility must be one of the standard RFC 5424 facility numbers 0 through 23.
 Severity mapping is trace/debug -> debug (7), info -> informational (6), warn ->
-warning (4), error -> error (3), fatal -> critical (2). Priority is
+warning (4), error -> error (3), fatal -> critical (2). For custom slog
+levels, compare the original integer value against the ordered native level
+thresholds: below trace maps to debug (7); between trace/debug and info maps
+to debug (7); between info and warn maps to informational (6); between warn
+and error maps to warning (4); error and above maps to error (3). Slog never
+maps to fatal/critical merely because its numeric level is high. Priority is
 `facility*8 + severity`.
 
 For UDP and TCP, `Address` is required. `DialTimeout` and
 `WriteTimeout` MUST be non-negative. Zero means a finite default of 5 seconds
 for each. DialTimeout bounds connection establishment; WriteTimeout applies
 to **each complete message**, not each individual socket write. Set the
-connection write deadline once before sending the frame/datagram. Local Syslog
-uses the same per-message WriteTimeout where the platform supports deadlines;
-otherwise the constructor MUST reject a requested local timeout if it cannot
-enforce it. The local implementation MUST NOT silently claim bounded writes.
+connection write deadline once before sending the frame/datagram. Local Syslog ignores both timeout fields only when they are zero; any non-zero
+`DialTimeout` or `WriteTimeout` for local transport MUST be rejected with
+`ErrInvalidConfig`, because V2 makes no deadline guarantee for local syslog.
+The zero values still select 5-second defaults for UDP/TCP only. The local
+implementation MUST NOT claim bounded writes.
 
 A remote connection is opened by the constructor and protected by a mutex.
-V2 does not reconnect or retry after transport failure. TCP uses RFC 6587
-octet-counting framing; UDP sends one RFC 5424 message per datagram.
+Remote writer states are `CONNECTED`, `DISCONNECTED`, and `CLOSED`.
+`CONNECTED` owns a usable socket; `DISCONNECTED` owns none and may attempt
+reconnection; `CLOSED` is terminal. A failed initial dial returns an error
+and no writer. A TCP transport failure (including timeout or partial frame)
+closes the socket and enters `DISCONNECTED`; the failed record is never
+replayed. A UDP transport error indicating loss of the socket enters
+`DISCONNECTED`, but a record-local datagram error such as `EMSGSIZE` MUST
+NOT disconnect a usable socket. UDP success means only local acceptance.
+
+Reconnection is synchronous and occurs only on a subsequent non-empty `Write`.
+At most one dial is attempted per eligible call while holding the writer mutex;
+there is no background goroutine, queue, or retry of a failed record. A failed
+dial starts a fixed 60-second monotonic backoff, measured from its completion.
+The first write after a connected socket fails also starts that backoff, so
+immediate subsequent calls cannot busy-loop. While backoff is active, `Write`
+returns `(0, ErrSyslogUnavailable)` without dialing. When eligible, `Write`
+attempts a bounded dial using `DialTimeout`; if successful, it sends only the
+current record and transitions to `CONNECTED`. Dial failure returns an error
+wrapping `ErrSyslogUnavailable` and its underlying cause. Tests MUST use an
+internal monotonic clock hook; no public retry option is added. `Close` from
+any state enters `CLOSED`, is idempotent, and prevents reconnecting.
+TCP uses RFC 6587 octet-counting framing; UDP sends one RFC 5424 message per
+datagram.
 
 The RFC 5424 wire message is exactly:
 `<PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG`.
@@ -807,24 +836,28 @@ fields into RFC 5424 STRUCTURED-DATA. For TCP, prefix the byte length of the
 entire RFC 5424 message, followed by one ASCII space; the length excludes the
 prefix itself.
 
-Local Syslog uses the platform's standard local facility through
-platform-specific files. On Windows it returns `ErrSyslogLocalUnsupported`.
+Local Syslog uses the platform's native local syslog interface and framing,
+not necessarily RFC 5424. On supported Unix systems, it MUST use the native
+syslog protocol accepted by the platform endpoint (typically BSD/RFC 3164-like
+framing) and MUST NOT prepend RFC 5424 version `1` unless the selected local
+endpoint explicitly requires it. Platform-specific behavior MUST be verified
+on Linux and macOS; no RFC 5424 wire-format guarantee is made for local.
+On Windows it returns `ErrSyslogLocalUnsupported`.
 Address must be empty for local and non-empty for UDP/TCP. An empty Tag
 defaults to the executable base name, then undergoes the same validation.
 
 A TCP frame write loops over partial writes until the complete frame is
-accepted or a failure occurs. If any TCP frame fails or times out, close the
-connection and permanently mark the writer BROKEN. All subsequent writes
-return `ErrSyslogUnavailable` until the caller constructs a new writer.
-A failed UDP datagram also marks the writer BROKEN, with no automatic retry.
-UDP success means only local acceptance, not remote receipt. Direct
-`Write` returns `len(p)` only on complete frame/datagram acceptance and
-returns `(0,error)` on any framing/transport failure, even if a TCP prefix
-was partially sent. This is a record-level contract, not a claim that no
-bytes reached the network. Close is idempotent; writes after Close return
-`ErrClosed`. Severity mapping remains trace/debug=7, info=6, warn=4,
-error=3, fatal=2; unknown custom slog levels use the nearest lower standard
-severity band, without changing filtering.
+accepted or a failure occurs. A partial or failed TCP frame is not replayed;
+its socket is discarded as described above. UDP `EMSGSIZE` and equivalent
+record-local oversized-datagram failures return an error for that record only
+and retain `CONNECTED`. Other UDP errors MUST be classified as either
+record-local (preserve socket) or transport failure (disconnect); unrecognized
+transport errors conservatively disconnect. Direct `Write` returns `len(p)`
+only on complete frame/datagram acceptance and returns `(0, error)` on any
+framing/transport failure, even if a TCP prefix was partially sent. This is
+a record-level contract, not a claim that no bytes reached the network.
+Writes after Close return `ErrClosed`. Filtering and custom-level severity
+mapping are independent.
 
 
 For structured slog-to-Syslog use:
@@ -867,6 +900,11 @@ messages, timestamp behavior, and sinks.
 
 No numeric performance promise is a release gate until a reproducible baseline
 is recorded. Correctness, race freedom, and failure observability are gates.
+Before freezing the Event API, MUST benchmark disabled `Info().Str(...).Msg(...)`
+and `Info().MsgErr(...)` at a disabled level with `-benchmem`, record escape
+analysis (`-gcflags=-m=2`) and allocations/op, and decide whether the existing
+chainable disabled Event design is acceptable. A nil-safe Event API MUST NOT be
+adopted solely on an unverified allocation assumption.
 
 ## 14. Required tests
 
@@ -893,7 +931,8 @@ interfaces or test-only hooks, not exported production APIs.
 - console quoting, dotted-group escaping, and exact ANSI boundaries;
 - short writes and error handler exactly-once/non-recursion behavior;
 - default Logger error handler one-second rate limit, suppression counts,
-  and concurrent calls; console degraded-null presentation ambiguity;
+  and concurrent calls, deterministic one-second monotonic-clock hook,
+  and accepted unflushed suppression tail; console degraded-null ambiguity;
 - concurrent derived loggers sharing an intentionally unsafe writer.
 
 ### RotatingWriter and retention
@@ -925,10 +964,15 @@ interfaces or test-only hooks, not exported production APIs.
 - `WithAttrs` before/after groups, nested/empty/inline groups, scalar/group
   conflicts, direct `LogValuer` resolution, panic, recursion exhaustion,
   ordinary error values, and record time;
-- Syslog priority/facility mapping and exact RFC 5424 UDP/RFC 6587 TCP framing;
-- local supported/unsupported builds, bad config, timeout, partial TCP write,
-  connection failure, broken TCP stream after partial frame, bounded timeouts,
-  newline injection defense, and Close.
+- Syslog priority/facility mapping including custom slog levels below trace,
+  exact RFC 5424 UDP/RFC 6587 TCP framing;
+- local Linux/macOS native framing, Windows unsupported builds, local
+  non-zero timeout rejection, UDP/TCP 5-second defaults, bounded deadlines;
+- CONNECTED/DISCONNECTED/CLOSED transitions, failed initial dial, TCP partial
+  frame/timeout, no replay, reconnect success/failure, 60-second monotonic
+  backoff with internal hook, concurrent Write/Close and terminal Close;
+- UDP EMSGSIZE preserves CONNECTED, other datagram vs transport errors,
+  newline injection defense and record-level write counts.
 
 The following must pass:
 

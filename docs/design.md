@@ -789,7 +789,7 @@ maps to fatal/critical merely because its numeric level is high. Priority is
 
 For TCP, `Address` is required. Both timeout fields MUST be
 non-negative. Zero `DialTimeout` selects 1 second; zero `WriteTimeout` selects
-5 seconds. `DialTimeout` bounds each remote or local socket dial. The effective
+1 second for local Syslog and 5 seconds for remote TCP. `DialTimeout` bounds each remote or local socket dial. The effective
 `WriteTimeout` applies to each complete message, not each socket write: set
 one deadline before sending a frame or local Unix datagram, including on `net.UnixConn`.
 Local Unix sockets MUST enforce `SetWriteDeadline`; unsupported endpoints
@@ -806,15 +806,25 @@ construction). All transports use the mutex-protected `CONNECTED`,
 to `DISCONNECTED` MUST wrap `ErrSyslogUnavailable` and the underlying cause,
 including the first connected-socket failure and failures after reconnection.
 A failed stream send that invalidates the connection wraps
-`ErrSyslogUnavailable`. For local `unixgram`, `EMSGSIZE`, `ENOBUFS`, and
-write-deadline timeout are record-local failures: return the underlying error
-without `ErrSyslogUnavailable` and preserve `CONNECTED`. `ECONNREFUSED`,
+`ErrSyslogUnavailable`. For local `unixgram`, `EMSGSIZE` and `ENOBUFS` are
+record-local failures: return the underlying error without
+`ErrSyslogUnavailable`, preserve `CONNECTED`, and do not start backoff.
+A `unixgram` write-deadline timeout preserves the socket but starts a
+60-second monotonic write-suppression backoff. The timed-out call returns
+`(0, error)` wrapping `ErrSyslogUnavailable` and the timeout cause; while
+suppressed, subsequent non-empty `Write` calls immediately return
+`(0, ErrSyslogUnavailable)` without touching the socket or dialing. After
+backoff, the next non-empty `Write` tries the retained socket once (no dial);
+on success clear suppression, on another timeout restart the 60-second
+backoff, and on a socket-invalidating error follow the disconnect path.
+The socket remains logically `CONNECTED` during suppression; this is an
+independent backoff flag, not a transition to `DISCONNECTED`. `ECONNREFUSED`,
 `ENOENT`, `net.ErrClosed`, and `EBADF` indicate an unavailable local endpoint
 and transition to `DISCONNECTED`, wrapping `ErrSyslogUnavailable`. Other
 `unixgram` errors preserve `CONNECTED` unless the socket is demonstrably
-invalid. The same classification applies to a send after reconnection; a
-record-local failure leaves the newly connected socket in `CONNECTED` without
-starting backoff. No failed record is replayed, including a partially sent
+invalid. The same classification applies to a send after reconnection; `EMSGSIZE` and
+`ENOBUFS` preserve the newly connected socket without backoff, while a write
+timeout preserves it with the suppression backoff described above. No failed record is replayed, including a partially sent
 TCP or local stream frame.
 
 A connected transport failure enters `DISCONNECTED` with one immediate
@@ -831,7 +841,9 @@ send fails with a transport error, discard the new socket, remain
 that invalidates the socket remains `DISCONNECTED` and starts backoff. No background goroutine, queue, or public retry
 option is provided. Tests use an internal monotonic clock hook. `Close` from
 any state is idempotent, enters `CLOSED`, and prevents reconnection.
-Remote Syslog supports TCP only, using RFC 6587 octet-counting. IP UDP is
+Remote Syslog supports plaintext TCP only, using RFC 6587 octet-counting.
+TLS is explicitly out of scope for V2; use a trusted network or an external
+TLS tunnel where confidentiality is required. IP UDP is
 not supported; `SyslogNetwork("udp")` MUST be rejected as `ErrInvalidConfig`.
 
 The RFC 5424 wire message is exactly:
@@ -844,7 +856,9 @@ MSGID and STRUCTURED-DATA are both `-`. The message body is the selected
 JSON or Console encoded record, without its trailing newline, encoded as UTF-8
 with **no BOM**. Before framing on ANY Syslog transport (TCP, local unixgram, or local Unix
 stream), the message body MUST escape embedded LF and CR as literal `\\n`
-and `\\r`. Only the single trailing input LF is removed first; framing
+and `\\r`. Literal backslash sequences such as `\\n` remain unchanged;
+this accepted representational ambiguity is not a record-delimiter risk.
+Only the single trailing input LF is removed first; framing
 separators are added afterward. This also applies to direct `Write`, so a
 caller-supplied multiline message cannot inject a second local stream record.
 The library does not map user
@@ -867,7 +881,10 @@ datagram without that delimiter. The implementation MUST NOT delegate writes
 to `log/syslog`, whose retry/replay behavior conflicts with this contract.
 Linux and macOS native endpoint/framing tests are required. macOS unified
 logging may keep info only in memory and omit persistence of debug by default;
-local socket acceptance does not guarantee persistence.
+local socket acceptance does not guarantee persistence. Local BSD-style TAG
+is allowed up to the common 48-byte V2 Tag validation limit even though some
+traditional receivers expect 32 bytes; receiver-specific truncation is
+possible and is not compensated for by V2.
 On Windows it returns `ErrSyslogLocalUnsupported`.
 Address is optional for local (explicit Unix socket path) and required for
 TCP. The local Address MUST be a filesystem socket path, not a `unix://` URI;
@@ -993,15 +1010,17 @@ interfaces or test-only hooks, not exported production APIs.
   exact RFC 5424 over RFC 6587 TCP framing; reject IP UDP config;
 - local Linux/macOS endpoint discovery, explicit local socket paths,
   native datagram/stream framing, Windows unsupported builds, local write
-  deadlines, remote dial default 1s, write default 5s, bounded deadlines
-  and direct-Write timestamp;
+  deadlines, remote dial default 1s, local write default 1s, TCP write
+  default 5s, bounded deadlines and direct-Write timestamp;
 - CONNECTED/DISCONNECTED/CLOSED for local and remote, failed initial dial,
   first disconnect errors.Is(ErrSyslogUnavailable), immediate reconnect,
   reconnect-send failure, no replay, 60-second monotonic backoff with hook,
   mutex-held dial blocking, concurrent Write/Close and terminal Close;
 - no IP UDP API or transport, reject `SyslogNetwork("udp")` with
-  `ErrInvalidConfig`; local unixgram EMSGSIZE/ENOBUFS/timeout preserve
-  CONNECTED, ECONNREFUSED/ENOENT disconnect, reconnect-send classification;
+  `ErrInvalidConfig`; local unixgram EMSGSIZE/ENOBUFS preserve CONNECTED
+  without backoff, timeout preserves socket with 60s write suppression,
+  timeout retry after backoff, ECONNREFUSED/ENOENT disconnect,
+  reconnect-send classification;
   direct-Write CR/LF injection defense for TCP/unixgram/Unix stream, and
   record-level write counts.
 

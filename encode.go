@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -37,8 +38,7 @@ func utf8String(s string) string {
 }
 
 func jsonString(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
+	return string(appendJSONString(nil, s))
 }
 
 func stringValue(s string) value {
@@ -80,11 +80,10 @@ func snapshot(input any, utc bool) (out value, err error) {
 	case uint64:
 		number = strconv.FormatUint(v, 10)
 	case float64:
-		b, marshalErr := json.Marshal(v)
-		if marshalErr != nil {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
 			return out, errors.New("non-finite float")
 		}
-		number = string(b)
+		number = strconv.FormatFloat(v, 'g', -1, 64)
 	case time.Time:
 		if utc {
 			v = v.UTC()
@@ -149,25 +148,29 @@ type node struct {
 
 type object struct {
 	entries []node
-	index   map[string]int
 }
 
 func (o *object) set(n node) {
-	if o.index == nil {
-		o.index = make(map[string]int)
+	for i := range o.entries {
+		if o.entries[i].key == n.key {
+			o.entries[i] = n
+			return
+		}
 	}
-	if i, ok := o.index[n.key]; ok {
-		o.entries[i] = n
-		return
-	}
-	o.index[n.key] = len(o.entries)
 	o.entries = append(o.entries, n)
 }
 
 func (o *object) descend(path []string) *object {
 	for _, key := range path {
-		if i, ok := o.index[key]; ok && o.entries[i].group != nil {
-			o = o.entries[i].group
+		found := false
+		for i := range o.entries {
+			if o.entries[i].key == key && o.entries[i].group != nil {
+				o = o.entries[i].group
+				found = true
+				break
+			}
+		}
+		if found {
 			continue
 		}
 		child := &object{}
@@ -179,10 +182,19 @@ func (o *object) descend(path []string) *object {
 
 func (o *object) relocate() {
 	var root, conflicts object
-	_, hasTime := o.index["time"]
-	_, hasLevel := o.index["level"]
-	_, hasMessage := o.index["message"]
-	_, hasFields := o.index["fields"]
+	var hasTime, hasLevel, hasMessage, hasFields bool
+	for i := range o.entries {
+		switch o.entries[i].key {
+		case "time":
+			hasTime = true
+		case "level":
+			hasLevel = true
+		case "message":
+			hasMessage = true
+		case "fields":
+			hasFields = true
+		}
+	}
 	if !hasTime && !hasLevel && !hasMessage && !hasFields {
 		return
 	}
@@ -244,7 +256,7 @@ func (l *Logger) submit(r record, fields []field, extra func(*object) error) err
 	if l.config.utc {
 		r.time = r.time.UTC()
 	}
-	var root object
+	root := object{entries: make([]node, 0, len(l.fields)+len(fields))}
 	var failures []error
 	add := func(fields []field) {
 		for _, f := range fields {
@@ -270,26 +282,26 @@ func (l *Logger) submit(r record, fields []field, extra func(*object) error) err
 }
 
 func encodeRecord(r record, c config, root *object) []byte {
-	var out strings.Builder
+	out := make([]byte, 0, 128)
 	if c.format == JSONFormat {
-		out.WriteByte('{')
+		out = append(out, '{')
 		if c.timestamp {
-			out.WriteString(`"time":`)
-			out.WriteString(jsonString(r.time.Format(time.RFC3339Nano)))
-			out.WriteByte(',')
+			out = append(out, `"time":`...)
+			out = appendJSONString(out, r.time.Format(time.RFC3339Nano))
+			out = append(out, ',')
 		}
-		out.WriteString(`"level":`)
-		out.WriteString(jsonString(r.name))
+		out = append(out, `"level":`...)
+		out = appendJSONString(out, r.name)
 		if r.message != nil {
-			out.WriteString(`,"message":`)
-			out.WriteString(jsonString(*r.message))
+			out = append(out, `,"message":`...)
+			out = appendJSONString(out, *r.message)
 		}
-		appendJSON(&out, root, true)
-		out.WriteByte('}')
+		out = appendJSON(out, root, true)
+		out = append(out, '}')
 	} else {
 		if c.timestamp {
-			out.WriteString(r.time.Format(time.RFC3339Nano))
-			out.WriteByte(' ')
+			out = r.time.AppendFormat(out, time.RFC3339Nano)
+			out = append(out, ' ')
 		}
 		if c.color {
 			color := "31"
@@ -305,52 +317,109 @@ func encodeRecord(r record, c config, root *object) []byte {
 			case !r.slog && r.level == int(FatalLevel):
 				color = "91"
 			}
-			out.WriteString("\x1b[" + color + "m")
+			out = append(out, "\x1b["...)
+			out = append(out, color...)
+			out = append(out, 'm')
 		}
-		out.WriteString(strings.ToUpper(r.name))
+		out = append(out, strings.ToUpper(r.name)...)
 		if c.color {
-			out.WriteString("\x1b[0m")
+			out = append(out, "\x1b[0m"...)
 		}
 		if r.message != nil {
-			out.WriteByte(' ')
-			out.WriteString(consoleToken(utf8String(*r.message)))
+			out = append(out, ' ')
+			out = append(out, consoleToken(utf8String(*r.message))...)
 		}
-		appendConsole(&out, root, "")
+		out = appendConsole(out, root, "")
 	}
-	out.WriteByte('\n')
-	return []byte(out.String())
+	return append(out, '\n')
 }
 
-func appendJSON(out *strings.Builder, o *object, comma bool) {
+func appendJSON(out []byte, o *object, comma bool) []byte {
 	for _, n := range o.entries {
 		if comma {
-			out.WriteByte(',')
+			out = append(out, ',')
 		}
 		comma = true
-		out.WriteString(jsonString(n.key))
-		out.WriteByte(':')
+		out = appendJSONString(out, n.key)
+		out = append(out, ':')
 		if n.group == nil {
-			out.WriteString(n.value.json)
+			out = append(out, n.value.json...)
 			continue
 		}
-		out.WriteByte('{')
-		appendJSON(out, n.group, false)
-		out.WriteByte('}')
+		out = append(out, '{')
+		out = appendJSON(out, n.group, false)
+		out = append(out, '}')
 	}
+	return out
+}
+
+// appendJSONString matches encoding/json's string escaping, including its
+// HTML-safe escapes and replacement of invalid UTF-8 with U+FFFD.
+func appendJSONString(out []byte, s string) []byte {
+	const hex = "0123456789abcdef"
+	out = append(out, '"')
+	start := 0
+	for i := 0; i < len(s); {
+		if b := s[i]; b < utf8.RuneSelf {
+			if b >= 0x20 && b != '\\' && b != '"' && b != '<' && b != '>' && b != '&' {
+				i++
+				continue
+			}
+			out = append(out, s[start:i]...)
+			switch b {
+			case '\\', '"':
+				out = append(out, '\\', b)
+			case '\b':
+				out = append(out, '\\', 'b')
+			case '\f':
+				out = append(out, '\\', 'f')
+			case '\n':
+				out = append(out, '\\', 'n')
+			case '\r':
+				out = append(out, '\\', 'r')
+			case '\t':
+				out = append(out, '\\', 't')
+			default:
+				out = append(out, '\\', 'u', '0', '0', hex[b>>4], hex[b&0xf])
+			}
+			i++
+			start = i
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			out = append(out, s[start:i]...)
+			out = append(out, "\\ufffd"...)
+			i++
+			start = i
+			continue
+		}
+		if r == '\u2028' || r == '\u2029' {
+			out = append(out, s[start:i]...)
+			out = append(out, '\\', 'u', '2', '0', '2', hex[r&0xf])
+			i += size
+			start = i
+			continue
+		}
+		i += size
+	}
+	out = append(out, s[start:]...)
+	return append(out, '"')
 }
 
 var pathEscaper = strings.NewReplacer(`\`, `\\`, ".", `\.`)
 
-func appendConsole(out *strings.Builder, o *object, prefix string) {
+func appendConsole(out []byte, o *object, prefix string) []byte {
 	for _, n := range o.entries {
 		key := prefix + pathEscaper.Replace(n.key)
 		if n.group != nil {
-			appendConsole(out, n.group, key+".")
+			out = appendConsole(out, n.group, key+".")
 			continue
 		}
-		out.WriteByte(' ')
-		out.WriteString(consoleToken(key))
-		out.WriteByte('=')
-		out.WriteString(n.value.console)
+		out = append(out, ' ')
+		out = append(out, consoleToken(key)...)
+		out = append(out, '=')
+		out = append(out, n.value.console...)
 	}
+	return out
 }

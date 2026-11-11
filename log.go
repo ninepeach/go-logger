@@ -234,6 +234,9 @@ func (c *Context) Logger() (*Logger, error) {
 
 func (c *Context) add(key string, value any) *Context {
 	if !c.consumed {
+		if c.fields == nil {
+			c.fields = make([]field, 0, 4)
+		}
 		c.fields = append(c.fields, field{key, value})
 	}
 	return c
@@ -272,6 +275,9 @@ func (l *Logger) Fatal() *Event { return l.event(FatalLevel) }
 func (e *Event) active() bool { return !e.disabled && !e.consumed }
 
 func (e *Event) add(key string, value any) *Event {
+	if e.fields == nil {
+		e.fields = make([]field, 0, 4)
+	}
 	e.fields = append(e.fields, field{key, value})
 	return e
 }

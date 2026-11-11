@@ -198,16 +198,19 @@ MUST NOT mutate the source logger. The output synchronization object, options,
 and error handler are shared. Primitive and byte fields are copied. `Context.Any` is serialized into an
 immutable JSON representation during `Context.Logger()`; the resulting bytes
 are owned by the derived logger, so subsequent caller mutation cannot affect it.
-Custom marshalers execute during `Context.Logger()`. Failed fields are
-snapshotted as degraded string values and their errors are returned by
-`Context.Logger()`; because this constructor returns no logger on error, callers
-MUST correct invalid shared fields before constructing a derived logger. The builder may collect `Any` values until that point; callers MUST NOT
-mutate them concurrently with `Logger()`. Existing parent snapshots are never
-re-serialized. A `Context` builder is single-use after `Logger()`.
-
-The builder records its first validation/encoding error. Later field calls are
-no-ops, and `Logger()` returns that error without producing a logger. Builders,
-like Events, are not goroutine-safe.
+Custom marshalers execute during `Context.Logger()`. Each failed field is
+snapshotted as JSON `null`, while other fields are preserved. `Logger()` MUST
+return the usable derived logger together with an error wrapping
+`ErrFieldEncoding`; multiple failures are combined using `errors.Join`.
+The caller MAY use the returned logger despite the non-nil error. Only a
+non-field-encoding configuration/invariant failure may return a nil logger;
+ordinary field encoding failures MUST NOT do so. The builder may collect
+`Any` values until `Logger()`; callers MUST NOT mutate them concurrently with
+that call. Existing parent snapshots are never re-serialized. A `Context`
+builder is single-use after `Logger()` and is not goroutine-safe. Field
+methods continue collecting after a field failure so independent fields are
+not discarded. `Context.Logger()` does not automatically invoke the error
+handler; its returned error is the caller's responsibility.
 
 ## 4. Record and field semantics
 
@@ -216,9 +219,8 @@ fields. Within each user-field section, insertion order is preserved.
 
 ### 4.1 Reserved names and conflicts
 
-The system members `time`, `level`, and `message` are reserved at the
-root. User attributes with these names are placed under the root `fields`
-object, rather than replacing system metadata. Only user attributes whose root key is `time`, `level`, `message`, or
+The system members `time`, `level`, and `message` are reserved at the root.
+Only user attributes whose root key is `time`, `level`, `message`, or
 `fields` are relocated into a root `fields` object. Other user attributes
 remain at the root. The root `fields` object is omitted if no conflicting
 attribute exists. A user attribute literally named `fields` is stored as
@@ -248,7 +250,7 @@ independent of user fields.
 | string | JSON string | quoted when required |
 | signed/unsigned integer | JSON number | decimal |
 | finite float | shortest round-trip JSON number | shortest round-trip number |
-| `NaN`, `+Inf`, `-Inf` | quoted string (`"NaN"`, `"+Inf"`, `"-Inf"`) and `ErrFieldEncoding` | same string and error |
+| `NaN`, `+Inf`, `-Inf` | `null` and `ErrFieldEncoding` | `null` and `ErrFieldEncoding` |
 | bool | JSON boolean | `true` or `false` |
 | time | RFC3339Nano string | RFC3339Nano |
 | duration | `time.Duration.String()` string | same |
@@ -261,18 +263,22 @@ value's location otherwise. Invalid UTF-8 in keys, strings, messages, errors,
 and `[]byte` produced through `Any` is replaced with U+FFFD, matching
 `encoding/json`; raw `Bytes` is Base64 and therefore unaffected.
 
-`Err(nil)` adds nothing. A non-nil `Err` is exactly equivalent to
-`Str("error", err.Error())` for conflict detection.
+`Err(nil)` adds nothing. A non-nil `Err` uses the key `error` and the
+string returned by `Error()` for conflict detection. Calling `Error()` MUST
+be panic-safe, including for typed-nil errors: a panic degrades that field to
+`null` and produces `ErrFieldEncoding` rather than crashing the logger.
 
 `Any` MUST use `encoding/json` semantics, including `json.Marshaler` and
 `encoding.TextMarshaler`. Cycles, unsupported values (including functions,
 channels, complex values, and map keys), invalid custom marshaler output,
 and non-finite floats cause field-level degradation, not record rejection.
-A failed field is replaced with a JSON string `"!marshal error"` (also used
-in console output), and an error wrapping `ErrFieldEncoding` identifies the
-field path and underlying cause without exposing its value. Panics from custom
-marshalers or `slog.LogValuer` are recovered at the field boundary and treated
-as field-level failures; application error-handler panics are never recovered.
+A failed field is replaced with JSON `null` (console text `null`), and an
+error wrapping `ErrFieldEncoding` identifies the field path and underlying
+cause without exposing its value. This preserves valid JSON but does not
+guarantee compatibility with every downstream schema. Panics from custom
+marshalers, `slog.LogValuer`, or `error.Error()` are recovered at the field
+boundary and treated as field-level failures; application error-handler
+panics are never recovered.
 Other valid fields and the record MUST still be written. `Any` output is embedded as JSON in
 JSON format. In console format, scalars use normal console rules and composite
 values use compact JSON. For `Event.Any`, marshaling occurs at submission, and its result is owned by
@@ -549,9 +555,17 @@ fallback returns `(len(p), nil)` and reports rotation failure solely through
 the maintenance-error channel. This permits active files to grow without bound
 while rotation is unavailable: reliability takes priority over MaxSize.
 After a failed rotation, suppress further rotation attempts for 60 seconds
-measured using monotonic elapsed time; normal writes continue, including
-writes that exceed MaxSize. The next eligible non-empty write may retry; no
-background timer or goroutine is required. If fallback writing itself fails,
+measured using a private monotonic clock based on `time.Now`; `FileConfig.TimeFunc`
+controls calendar/rotation dates only and MUST NOT control retry timing.
+Tests MUST inject an internal monotonic-clock hook (not a public option) to
+advance the backoff deterministically without sleeping. Backoff survives
+RECOVERING -> OPEN transitions and suppresses both size and daily rotation;
+normal writes continue, including writes that exceed MaxSize. The next eligible non-empty write may retry; no
+background timer or goroutine is required. While daily rotation is suppressed,
+`activeDate` remains the archived active file's original date. Thus records
+from a later day may be archived under the older date and age retention may
+remove them earlier than their individual write dates suggest; this is an
+accepted consequence of prioritizing successful writes. If fallback writing itself fails,
 return its actual byte count and write error. A
 write error at step 6 may mean a partial record was accepted, as indicated by
 its returned byte count. Cleanup failures at step 7 never change the returned
@@ -575,12 +589,14 @@ and clears the last pending maintenance error; nil means none. Maintenance failu
 are also reported through an optional `FileConfig.OnMaintenanceError func(error)`
 callback, invoked **after releasing the writer mutex**. The callback may run
 concurrently with other callbacks and MUST NOT call back into the same writer.
-A callback panic is application-owned. If no callback is configured, the error
-remains available via `TakeMaintenanceError`; no silent loss of observability is
-permitted. Cleanup is retried only after a later rotation. When both the callback and
+A callback panic is application-owned. If no callback is configured, the writer MUST emit a compact diagnostic to
+`os.Stderr` using a private synchronized, non-recursive fallback, outside its
+mutex. Repeated maintenance failures MUST be rate-limited (at most one default
+diagnostic per 60 seconds per writer); the pending latest-error slot remains
+available via `TakeMaintenanceError`. When both the callback and
 `TakeMaintenanceError` are used, each receives the error: the callback is a
-notification, and the slot is a separate latest-error snapshot. A callback
-MUST be invoked only after the writer mutex is released.
+notification and the slot is a separate latest-error snapshot. Cleanup is
+retried only after a later rotation.
 
 Rollback MUST NOT overwrite an active path that appeared concurrently. If a
 backup was successfully created but rollback cannot safely restore it, it stays
@@ -637,9 +653,8 @@ undeletable backup does not prevent handling others. See the independent mainten
 `NewSlogHandler` returns an immutable `slog.Handler` view over the logger. It
 uses the logger's level, clock/record time, format, shared output, encoder, and
 error policy. `Handle` returns errors directly AND reports each enabled submission failure
-exactly once through the slog error callback. By default this callback is the
-Logger's configured error handler; a separately configured slog callback MAY
-override it, but MUST NOT result in duplicate reporting. This is required
+exactly once through the Logger's configured error handler. No separate
+slog error callback or slog-specific public option is provided. This is required
 because `slog.Logger` discards errors returned by `Handler.Handle`.
 The adapter MUST use a submission path that does not itself invoke the Logger
 error handler before the adapter reports the error. A disabled record causes
@@ -655,8 +670,8 @@ values therefore retain their precise filtering behavior.
 
 For presentation, standard levels use `trace`, `debug`, `info`, `warn`,
 and `error` at their exact native values. Any other slog level is displayed
-using the canonical `slog.Level.String()` textual representation
-(e.g. `slog.Level(2).String()` is `INFO+2`, not `2`), and its original integer is retained in the normalized
+using the lowercase form of the canonical `slog.Level.String()` textual
+representation (e.g. `slog.Level(2)` becomes `info+2`, not `2`), and its original integer is retained in the normalized
 record. Slog never implicitly emits `fatal`; only native Fatal does.
 
 For enabled records, system fields use the original level and
@@ -706,8 +721,8 @@ The exact semantics are:
 - Later `WithGroup` calls do not move earlier attributes into the new group.
 - Multiple calls are cumulative and derived handlers never mutate parents.
 - Groups with no surviving attributes are omitted recursively.
-- Reserved names are forbidden only in the root object. A key such as
-  `http.time` is valid because `time` is nested.
+- Reserved-name relocation applies only at the root object. A nested key
+  such as `http.time` is valid without relocation.
 - Duplicate keys and scalar/group conflicts use section 4.1's last-write-wins
   rule within each resolved object.
 
@@ -856,8 +871,9 @@ interfaces or test-only hooks, not exported production APIs.
 - child immutability, Context.Any snapshot and caller slice/map mutation;
 - JSON validity, escaping, Unicode, invalid UTF-8, and exactly one newline;
 - `Any` field-level degradation, cycles, bad marshalers including panics,
-  special floats, `ErrFieldEncoding`, `errors.Join`, and successful writes
-  with non-nil `MsgErr`; Context.Any constructor errors;
+  special floats, typed-nil `Err` panics, `ErrFieldEncoding`, `errors.Join`,
+  and successful writes with non-nil `MsgErr`; Context.Any degraded snapshots
+  with usable non-nil Logger and non-nil error;
 - console quoting, dotted-group escaping, and exact ANSI boundaries;
 - short writes and error handler exactly-once/non-recursion behavior;
 - concurrent derived loggers sharing an intentionally unsafe writer.
@@ -874,16 +890,20 @@ interfaces or test-only hooks, not exported production APIs.
   sequence collisions, >9999, and unrelated lookalikes;
 - each failure-matrix row, rollback success/failure, RECOVERING recovery, and
   fallback write after recoverable rotation failure, 60-second monotonic
-  backoff, unbounded active growth, and no triggering bytes when RECOVERING;
+  backoff using an internal monotonic-clock hook, backoff across RECOVERING,
+  daily suppression/old `activeDate`, unbounded active growth, and no
+  triggering bytes when RECOVERING;
 - partial writes with size reconciliation;
 - age-only, count-only, combined, future-date, DST, and deletion-error retention;
-- cleanup failure does not reject an accepted record; maintenance-error retrieval and callback;
+- cleanup failure does not reject an accepted record; maintenance-error
+  retrieval, callback, default stderr reporting and rate limiting;
 - concurrent writes, Write/Close races, idempotent Close, and write after close.
 
 ### slog and Syslog
 
-- all `slog.Handler` methods and immutable derivation; callback fallback,
-  override, exactly-once reporting and retained Handle return errors;
+- all `slog.Handler` methods and immutable derivation; Logger error-handler
+  exactly-once reporting and retained Handle return errors; custom-level
+  lowercase presentation;
 - `WithAttrs` before/after groups, nested/empty/inline groups, scalar/group
   conflicts, `LogValuer`, resolution errors, and record time;
 - Syslog priority/facility mapping and exact RFC 5424 UDP/RFC 6587 TCP framing;

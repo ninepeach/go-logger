@@ -1,9 +1,9 @@
 package logger
 
 import (
-        "fmt"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 )
@@ -48,10 +48,10 @@ func (h *slogHandler) Handle(ctx context.Context, r slog.Record) error {
 		attrs := make([]slog.Attr, 0, r.NumAttrs())
 		r.Attrs(func(a slog.Attr) bool { attrs = append(attrs, a); return true })
 		h.apply(root, h.groups, attrs, 0, &failures)
-return errors.Join(
-    h.err,
-    errors.Join(failures...),
-)
+		return errors.Join(
+			h.err,
+			errors.Join(failures...),
+		)
 	})
 	if err != nil {
 		h.logger.config.report(err)

@@ -2,150 +2,207 @@ package logger
 
 import (
 	"bytes"
-	"os"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"math"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
-// Helper function to create a new standard logger for testing
-func newTestStdLogger(time, debug, trace, colors, pid bool, opts ...LogOption) *Logger {
-	return NewStdLogger(time, debug, trace, colors, pid, opts...)
-}
-
-// Helper function to create a new file logger for testing
-func newTestFileLogger(filename string, time, debug, trace, pid bool, opts ...LogOption) *Logger {
-	return NewFileLogger(filename, time, debug, trace, pid, opts...)
-}
-
-// Test: Standard logger creation and logging at various levels
-func TestNewStdLogger(t *testing.T) {
-	l := newTestStdLogger(true, true, false, false, true)
-	if l == nil {
-		t.Fatal("expected a new logger, got nil")
+func newLogger(t testing.TB, out io.Writer, opts ...Option) *Logger {
+	t.Helper()
+	l, err := New(out, opts...)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return l
+}
 
-	var buf bytes.Buffer
-	l.logger.SetOutput(&buf)
+type marshalFunc func() ([]byte, error)
 
-	// Test logging at various levels
-	l.Noticef("This is an info-level message")
-	verifyLogOutput(t, buf, "[INF] This is an info-level message")
+func (m marshalFunc) MarshalJSON() ([]byte, error) { return m() }
 
-	l.Warnf("This is a warning-level message")
-	verifyLogOutput(t, buf, "[WRN] This is a warning-level message")
+type panicError struct{ message string }
 
-	l.Errorf("This is an error-level message")
-	verifyLogOutput(t, buf, "[ERR] This is an error-level message")
+func (e *panicError) Error() string { return e.message }
 
-	// These lines won't run due to Fatalf above, but are shown for demonstration
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("expected panic on Fatalf, but did not panic")
+type writerFunc func([]byte) (int, error)
+
+func (w writerFunc) Write(p []byte) (int, error) { return w(p) }
+
+func TestNativeRecord(t *testing.T) {
+	var out bytes.Buffer
+	clock := time.Date(2026, 11, 11, 17, 23, 0, 123, time.FixedZone("test", 8*3600))
+	l := newLogger(t, &out, WithTimeFunc(func() time.Time { return clock }))
+	mutable := map[string]int{"n": 1}
+	raw := []byte{0, 255}
+	builder := l.With().Str("before", "first").Any("map", mutable).Bytes("bytes", raw).Str("level", "user")
+	child, err := builder.Logger()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, err := builder.Logger(); again != nil || err != ErrEventConsumed {
+		t.Fatal(again, err)
+	}
+	mutable["n"] = 9
+	raw[0] = 9
+	e := child.Fatal().Int("before", 42).Str("message", "field").Str("fields", "literal").Str("", "").Bool("ok", true).
+		Float64("ratio", 0.1).Time("when", clock).Dur("elapsed", time.Second).Int64("signed", -2).
+		Uint64("unsigned", math.MaxUint64).Err(errors.New("example")).Str("\xff", "\xff")
+	if err := e.MsgErr(""); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Str("ignored", "yes").SendErr(); err != ErrEventConsumed {
+		t.Fatal(err)
+	}
+	want := `{"time":"2026-11-11T09:23:00.000000123Z","level":"fatal","message":"","before":42,"map":{"n":1},"bytes":"AP8=","fields":{"level":"user","message":"field","fields":"literal"},"":"","ok":true,"ratio":0.1,"when":"2026-11-11T09:23:00.000000123Z","elapsed":"1s","signed":-2,"unsigned":18446744073709551615,"error":"example","�":"�"}`
+	if got := out.String(); got != want+"\n" || !json.Valid([]byte(got)) {
+		t.Fatalf("got %s\nwant %s", got, want)
+	}
+}
+
+func TestFieldFailuresAndLifecycle(t *testing.T) {
+	var out bytes.Buffer
+	var reports []error
+	l := newLogger(t, &out, WithTimestamp(false), WithErrorHandler(func(e error) { reports = append(reports, e) }))
+	cause := errors.New("private value")
+	calls := 0
+	m := marshalFunc(func() ([]byte, error) { calls++; return nil, cause })
+	ctx := l.With().Any("broken", m).Str("shared", "ok")
+	child, err := ctx.Logger()
+	if !errors.Is(err, ErrFieldEncoding) || !errors.Is(err, cause) || strings.Contains(err.Error(), cause.Error()) || child == nil || calls != 1 {
+		t.Fatal(child, err, calls)
+	}
+	if _, err := ctx.Logger(); err != ErrEventConsumed || calls != 1 {
+		t.Fatal(err, calls)
+	}
+	cycle := map[string]any{}
+	cycle["cycle"] = cycle
+	var typedNil *panicError
+	ev := child.Info().Any("cycle", cycle).Any("panic", marshalFunc(func() ([]byte, error) { panic("secret") })).
+		Any("invalid", json.RawMessage("!")).Float64("nan", math.NaN()).Err(typedNil)
+	ev.Send()
+	if len(reports) != 1 || !errors.Is(reports[0], ErrFieldEncoding) || strings.Contains(reports[0].Error(), "secret") {
+		t.Fatal(reports)
+	}
+	want := `{"level":"info","broken":null,"shared":"ok","cycle":null,"panic":null,"invalid":null,"nan":null,"error":null}` + "\n"
+	if out.String() != want {
+		t.Fatal(out.String())
+	}
+	ev.Msg("second")
+	if len(reports) != 2 || reports[1] != ErrEventConsumed || out.String() != want {
+		t.Fatal(reports, out.String())
+	}
+	short := newLogger(t, writerFunc(func(p []byte) (int, error) { return len(p) - 1, nil }), WithErrorHandler(func(error) { t.Fatal("unexpected report") }))
+	if err := short.Info().Any("bad", m).SendErr(); !errors.Is(err, io.ErrShortWrite) || !errors.Is(err, cause) || !errors.Is(err, ErrFieldEncoding) {
+		t.Fatal(err)
+	}
+}
+
+func TestLevelValidationAndDisabled(t *testing.T) {
+	for _, level := range []Level{TraceLevel, DebugLevel, InfoLevel, WarnLevel, ErrorLevel, FatalLevel, DisabledLevel} {
+		if got, err := ParseLevel(strings.ToUpper(level.String())); got != level || err != nil {
+			t.Fatal(got, err)
 		}
-	}()
-	l.Fatalf("This is a fatal-level message")
+	}
+	for _, opts := range [][]Option{{WithLevel(1)}, {WithFormat(2)}, {WithColor(true)}, {WithTimeFunc(nil)}, {WithErrorHandler(nil)}, {nil}} {
+		if _, err := New(io.Discard, opts...); !errors.Is(err, ErrInvalidConfig) {
+			t.Fatal(err)
+		}
+	}
+	l := newLogger(t, writerFunc(func([]byte) (int, error) { t.Fatal("disabled write"); return 0, nil }), WithLevel(DisabledLevel),
+		WithTimeFunc(func() time.Time { t.Fatal("disabled clock"); return time.Time{} }),
+		WithErrorHandler(func(error) { t.Fatal("disabled handler") }))
+	ev := l.Info().Any("x", marshalFunc(func() ([]byte, error) { t.Fatal("disabled encoding"); return nil, nil })).Bytes("data", []byte{1})
+	if ev.fields != nil || ev.MsgErr("") != nil || ev.SendErr() != ErrEventConsumed {
+		t.Fatal("disabled lifecycle")
+	}
+	if _, err := l.WithLevel(1); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatal(err)
+	}
 }
 
-// Test: Standard logger with UTC time option
-func TestLoggerWithUTC(t *testing.T) {
-	l := newTestStdLogger(true, true, true, false, true, LogUTC(true))
-	if l == nil {
-		t.Fatal("expected a new logger, got nil")
+func TestConsole(t *testing.T) {
+	var out bytes.Buffer
+	l := newLogger(t, &out, WithTimestamp(false), WithFormat(ConsoleFormat), WithColor(true), WithLevel(TraceLevel))
+	l.Trace().Str("http.method", "GET").Str("space key", "two words").Str("empty", "").Any("object", map[string]string{"x": "a b"}).Msg("x\ny")
+	want := "\x1b[90mTRACE\x1b[0m \"x\\ny\" \"http\\\\.method\"=GET \"space key\"=\"two words\" empty=\"\" object=\"{\\\"x\\\":\\\"a b\\\"}\"\n"
+	if out.String() != want {
+		t.Fatalf("got %q\nwant %q", out.String(), want)
 	}
-
-	var buf bytes.Buffer
-	l.logger.SetOutput(&buf)
-
-	// Log a UTC message
-	l.Noticef("This is a LogUTC message")
-	verifyLogOutput(t, buf, "[INF] This is a LogUTC message")
 }
 
-// Test: File logger creation, file size limit, and file rotation
-func TestLoggerFileRotation(t *testing.T) {
-	tmpFile := "./test_rotate.log"
-	defer os.Remove(tmpFile)
+type logValueFunc func() slog.Value
 
-	l := newTestFileLogger(tmpFile, true, true, true, true)
-	if l == nil {
-		t.Fatal("expected a new file logger, got nil")
+func (f logValueFunc) LogValue() slog.Value { return f() }
+
+func TestSlogGroupsAndLevels(t *testing.T) {
+	var out bytes.Buffer
+	var reports []error
+	l := newLogger(t, &out, WithTimestamp(false), WithErrorHandler(func(e error) { reports = append(reports, e) }))
+	ctx := context.Background()
+	root := NewSlogHandler(l)
+	if err := NewSlogHandler(nil).Handle(ctx, slog.Record{}); err != ErrNilLogger {
+		t.Fatal(err)
 	}
+	h := root.WithAttrs([]slog.Attr{slog.String("http", "scalar"), slog.String("level", "user")}).
+		WithGroup("http").WithAttrs([]slog.Attr{slog.String("method", "GET")}).
+		WithGroup("request").WithGroup("")
+	r := slog.NewRecord(time.Time{}, slog.Level(2), "hello", 0)
+	r.AddAttrs(slog.Int("id", 7), slog.Group("", slog.String("time", "nested")), slog.Group("empty"),
+		slog.Any("bad", logValueFunc(func() slog.Value { panic("secret") })), slog.Any("ordinary", errors.New("ordinary")))
+	if err := h.Handle(ctx, r); !errors.Is(err, ErrFieldEncoding) || len(reports) != 1 {
+		t.Fatal(err, reports)
+	}
+	want := `{"level":"info+2","message":"hello","http":{"method":"GET","request":{"id":7,"time":"nested","bad":null,"ordinary":{}}},"fields":{"level":"user"}}` + "\n"
+	if out.String() != want {
+		t.Fatal(out.String())
+	}
+	for level := -12; level <= 16; level++ {
+		if h.Enabled(ctx, slog.Level(level)) != (level >= 0) {
+			t.Fatal(level)
+		}
+	}
+	out.Reset()
+	if err := root.Handle(ctx, slog.NewRecord(time.Time{}, slog.LevelDebug, "off", 0)); err != nil || out.Len() != 0 {
+		t.Fatal(err, out.String())
+	}
+	if err := root.Handle(ctx, slog.NewRecord(time.Time{}, 12, "high", 0)); err != nil || !strings.Contains(out.String(), `"level":"error+4"`) {
+		t.Fatal(err, out.String())
+	}
+}
 
-	// Set file size limit for rotation
-	err := l.SetSizeLimit(1 * 1024) // 1 KB size limit for the log file
+func TestSharedWriterConcurrent(t *testing.T) {
+	var out bytes.Buffer
+	l := newLogger(t, &out, WithTimestamp(false))
+	child, err := l.With().Str("source", "child").Logger()
 	if err != nil {
-		t.Fatalf("unexpected error setting size limit: %v", err)
+		t.Fatal(err)
 	}
-
-	// Simulate logging with file rotation (writing multiple logs)
-	for i := 0; i < 20; i++ {
-		l.Noticef("Log message number %d", i)
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				l.Info().Int("id", j).Send()
+				child.Info().Int("id", j).Send()
+			}
+		}()
 	}
-
-	// Check if the log file exists and is not empty
-	if _, err := os.Stat(tmpFile); os.IsNotExist(err) {
-		t.Errorf("expected log file to be created, got error: %v", err)
+	wg.Wait()
+	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(lines) != 1200 {
+		t.Fatal(len(lines))
 	}
-
-	fileInfo, err := os.Stat(tmpFile)
-	if err != nil || fileInfo.Size() == 0 {
-		t.Errorf("expected non-empty log file, got error: %v or empty file", err)
-	}
-
-	// Optionally check if the file is rotated or split based on size
-	// Further logic could be added here to verify file rotation, if implemented
-}
-
-// Test: File logger max file count
-func TestLoggerMaxNumFiles(t *testing.T) {
-	tmpFile := "./test_max_files.log"
-	defer os.Remove(tmpFile)
-
-	l := newTestFileLogger(tmpFile, true, true, true, true)
-	if l == nil {
-		t.Fatal("expected a new file logger, got nil")
-	}
-
-	// Set max number of files
-	err := l.SetMaxNumFiles(5)
-	if err != nil {
-		t.Fatalf("unexpected error setting max number of files: %v", err)
-	}
-
-	// You can test the rotation logic further if needed
-	// Simulate multiple logs to trigger file rotation and test retention of max files
-	for i := 0; i < 100; i++ {
-		l.Noticef("Log message number %d", i)
-	}
-
-	// Verify that the log files are rotated and the number of files is retained as expected
-	// Further verification logic can be added here if needed
-}
-
-// Helper function to verify log output
-func verifyLogOutput(t *testing.T, buf bytes.Buffer, expected string) {
-	if !bytes.Contains(buf.Bytes(), []byte(expected)) {
-		t.Errorf("expected log output '%s', got: %s", expected, buf.String())
-	}
-}
-
-// Test: Close the logger
-func TestLoggerClose(t *testing.T) {
-	tmpFile := "./test_close.log"
-	defer os.Remove(tmpFile)
-
-	l := newTestFileLogger(tmpFile, true, true, true, true)
-	if l == nil {
-		t.Fatal("expected a new file logger, got nil")
-	}
-
-	// Close the logger
-	err := l.Close()
-	if err != nil {
-		t.Fatalf("unexpected error closing logger: %v", err)
-	}
-
-	// After closing, the file should no longer be writable
-	if _, err := os.Stat(tmpFile); os.IsNotExist(err) {
-		t.Errorf("expected log file to be present after closing, got error: %v", err)
+	for _, line := range lines {
+		if !json.Valid([]byte(line)) {
+			t.Fatal(line)
+		}
 	}
 }

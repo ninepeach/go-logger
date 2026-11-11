@@ -1,121 +1,245 @@
 package logger
 
 import (
-    "fmt"
-    "log"
-    "log/syslog"
-    "net/url"
-    "os"
-    "strings"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 )
 
-// SysLogger provides a system logger implementation.
-type SysLogger struct {
-    writer *syslog.Writer
-    debug  bool
-    trace  bool
+// SyslogNetwork selects a supported Syslog transport.
+type SyslogNetwork string
+
+const (
+	SyslogLocal SyslogNetwork = "local" // SyslogLocal selects a local Unix socket.
+	SyslogTCP   SyslogNetwork = "tcp"   // SyslogTCP selects RFC 6587 octet-counted TCP.
+)
+
+// SyslogConfig configures a synchronous Syslog connection.
+type SyslogConfig struct {
+	Network      SyslogNetwork // Network is the transport.
+	Address      string        // Address is a TCP host:port or an optional local socket path.
+	Tag          string        // Tag is the application name, defaulting to the executable name.
+	Facility     int           // Facility is an RFC 5424 facility from 0 through 23.
+	DialTimeout  time.Duration // DialTimeout defaults to one second.
+	WriteTimeout time.Duration // WriteTimeout defaults to one second locally and five seconds for TCP.
 }
 
-// GetSysLoggerTag generates a tag name for syslog based on the executable name.
-func GetSysLoggerTag() string {
-    procName := os.Args[0]
-    if idx := strings.LastIndex(procName, string(os.PathSeparator)); idx != -1 {
-        return procName[idx+1:]
-    }
-    return procName
+type syslogConn struct {
+	net.Conn
+	network string
 }
 
-// NewSysLogger creates a new system logger for local or remote use.
-func NewSysLogger(addr string, debug, trace bool) (*SysLogger, error) {
-    network, destination, err := parseAddress(addr)
-    if err != nil {
-        return nil, fmt.Errorf("failed to parse syslog address: %v", err)
-    }
-
-    var writer *syslog.Writer
-    if network == "" { // Local syslog
-        writer, err = syslog.New(syslog.LOG_DAEMON|syslog.LOG_NOTICE, GetSysLoggerTag())
-    } else { // Remote syslog
-        writer, err = syslog.Dial(network, destination, syslog.LOG_DEBUG, GetSysLoggerTag())
-    }
-
-    if err != nil {
-        return nil, fmt.Errorf("failed to connect to syslog: %v", err)
-    }
-
-    return &SysLogger{
-        writer: writer,
-        debug:  debug,
-        trace:  trace,
-    }, nil
+// SyslogWriter sends complete messages and reconnects synchronously after transport failures.
+type SyslogWriter struct {
+	mu            sync.Mutex
+	cfg           SyslogConfig
+	dial          func() (syslogConn, error)
+	mono          func() time.Time
+	now           func() time.Time
+	conn          syslogConn
+	closed        bool
+	retryAt       time.Time
+	hostname, pid string
 }
 
-// parseAddress parses the address for remote syslog.
-func parseAddress(addr string) (network, destination string, err error) {
-    if addr == "" {
-        return "", "", nil // Local syslog
-    }
-
-    u, err := url.Parse(addr)
-    if err != nil {
-        return "", "", err
-    }
-
-    switch u.Scheme {
-    case "udp", "tcp":
-        return u.Scheme, u.Host, nil
-    case "unix":
-        return u.Scheme, u.Path, nil
-    default:
-        return "", "", fmt.Errorf("invalid network type: %q", u.Scheme)
-    }
+// NewSyslogWriter opens the configured transport.
+func NewSyslogWriter(cfg SyslogConfig) (*SyslogWriter, error) {
+	if cfg.Facility < 0 || cfg.Facility > 23 || cfg.DialTimeout < 0 || cfg.WriteTimeout < 0 {
+		return nil, fmt.Errorf("%w: syslog facility or timeout", ErrInvalidConfig)
+	}
+	if cfg.Tag == "" {
+		cfg.Tag = filepath.Base(os.Args[0])
+	}
+	if !headerToken(cfg.Tag, 48) {
+		return nil, fmt.Errorf("%w: syslog tag", ErrInvalidConfig)
+	}
+	if cfg.DialTimeout == 0 {
+		cfg.DialTimeout = time.Second
+	}
+	if cfg.WriteTimeout == 0 {
+		cfg.WriteTimeout = time.Second
+		if cfg.Network == SyslogTCP {
+			cfg.WriteTimeout = 5 * time.Second
+		}
+	}
+	w := &SyslogWriter{cfg: cfg, mono: time.Now, now: time.Now, pid: strconv.Itoa(os.Getpid())}
+	hostname, err := os.Hostname()
+	if err != nil || !headerToken(hostname, 255) {
+		hostname = "-"
+	}
+	w.hostname = hostname
+	switch cfg.Network {
+	case SyslogTCP:
+		if cfg.Address == "" {
+			return nil, fmt.Errorf("%w: TCP address is required", ErrInvalidConfig)
+		}
+		w.dial = func() (syslogConn, error) {
+			c, err := net.DialTimeout("tcp", cfg.Address, cfg.DialTimeout)
+			return syslogConn{c, "tcp"}, err
+		}
+	case SyslogLocal:
+		if strings.Contains(cfg.Address, "://") || strings.HasPrefix(cfg.Address, "@") || strings.IndexByte(cfg.Address, 0) >= 0 {
+			return nil, fmt.Errorf("%w: local address must be a filesystem path", ErrInvalidConfig)
+		}
+		w.dial = func() (syslogConn, error) { return dialLocal(cfg.Address, cfg.DialTimeout) }
+	default:
+		return nil, fmt.Errorf("%w: syslog network", ErrInvalidConfig)
+	}
+	w.conn, err = w.dial()
+	if err != nil {
+		if errors.Is(err, ErrSyslogLocalUnsupported) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("logger: initial syslog dial: %w: %w", ErrSyslogUnavailable, err)
+	}
+	return w, nil
 }
 
-// logf handles generic log formatting and writes to syslog.
-func (l *SysLogger) logf(level func(string) error, format string, v ...interface{}) {
-    if err := level(fmt.Sprintf(format, v...)); err != nil {
-        log.Printf("failed to write to syslog: %v", err)
-    }
+func headerToken(s string, max int) bool {
+	if len(s) == 0 || len(s) > max {
+		return false
+	}
+	for _, b := range []byte(s) {
+		if b < 33 || b > 126 {
+			return false
+		}
+	}
+	return true
 }
 
-// Noticef logs a notice message.
-func (l *SysLogger) Noticef(format string, v ...interface{}) {
-    l.logf(l.writer.Notice, format, v...)
+func priority(facility int, r record) int {
+	severity := 7
+	switch {
+	case !r.slog && r.level == int(FatalLevel):
+		severity = 2
+	case r.level >= int(ErrorLevel):
+		severity = 3
+	case r.level >= int(WarnLevel):
+		severity = 4
+	case r.level >= int(InfoLevel):
+		severity = 6
+	}
+	return facility*8 + severity
 }
 
-// Warnf logs a warning message.
-func (l *SysLogger) Warnf(format string, v ...interface{}) {
-    l.logf(l.writer.Warning, format, v...)
+// Write sends an informational message.
+func (w *SyslogWriter) Write(p []byte) (int, error) {
+	return w.writeRecord(p, record{level: int(InfoLevel)})
 }
 
-// Fatalf logs a fatal error
-func (l *SysLogger) Fatalf(format string, v ...any) {
-    l.logf(l.writer.Crit, format, v...)
+var syslogEscaper = strings.NewReplacer("\r", `\r`, "\n", `\n`)
+
+func (w *SyslogWriter) frame(p []byte, r record) []byte {
+	msg := syslogEscaper.Replace(utf8String(strings.TrimSuffix(string(p), "\n")))
+	pri := priority(w.cfg.Facility, r)
+	if w.conn.network == "tcp" {
+		body := fmt.Sprintf("<%d>1 %s %s %s %s - - %s", pri, r.time.UTC().Format(time.RFC3339), w.hostname, w.cfg.Tag, w.pid, msg)
+		return []byte(strconv.Itoa(len(body)) + " " + body)
+	}
+	body := fmt.Sprintf("<%d>%s %s[%s]: %s", pri, r.time.Local().Format(time.Stamp), w.cfg.Tag, w.pid, msg)
+	if w.conn.network == "unix" {
+		body += "\n"
+	}
+	return []byte(body)
 }
 
-// Errorf logs an error message.
-func (l *SysLogger) Errorf(format string, v ...interface{}) {
-    l.logf(l.writer.Err, format, v...)
+func (w *SyslogWriter) writeRecord(p []byte, r record) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return 0, ErrClosed
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.time.IsZero() {
+		r.time = w.now()
+	}
+	if w.mono().Before(w.retryAt) {
+		return 0, ErrSyslogUnavailable
+	}
+	reconnect := w.conn.Conn == nil
+	if reconnect {
+		c, err := w.dial()
+		if err != nil {
+			w.retryAt = w.mono().Add(retryDelay)
+			return 0, fmt.Errorf("logger: reconnect syslog: %w: %w", ErrSyslogUnavailable, err)
+		}
+		w.conn = c
+	}
+	frame := w.frame(p, r)
+	deadlineErr := w.conn.SetWriteDeadline(time.Now().Add(w.cfg.WriteTimeout))
+	err := deadlineErr
+	if err == nil {
+		err = sendFrame(w.conn, frame)
+	}
+	if err == nil {
+		w.retryAt = time.Time{}
+		return len(p), nil
+	}
+	if w.conn.network == "unixgram" && deadlineErr == nil {
+		switch classifyDatagram(err) {
+		case datagramKeep:
+			w.retryAt = time.Time{}
+			return 0, fmt.Errorf("logger: write syslog datagram: %w", err)
+		case datagramSuppress:
+			w.retryAt = w.mono().Add(retryDelay)
+			return 0, fmt.Errorf("logger: write syslog datagram: %w: %w", ErrSyslogUnavailable, err)
+		}
+	}
+	closeErr := w.conn.Close()
+	w.conn = syslogConn{}
+	w.retryAt = time.Time{}
+	if reconnect {
+		w.retryAt = w.mono().Add(retryDelay)
+	}
+	return 0, fmt.Errorf("logger: write syslog: %w: %w", ErrSyslogUnavailable, errors.Join(err, closeErr))
 }
 
-// Debugf logs a debug message if debug is enabled.
-func (l *SysLogger) Debugf(format string, v ...interface{}) {
-    if l.debug {
-        l.logf(l.writer.Debug, format, v...)
-    }
+func sendFrame(c syslogConn, p []byte) error {
+	for len(p) > 0 {
+		n, err := c.Write(p)
+		if err != nil {
+			return err
+		}
+		if n <= 0 || n > len(p) || (c.network == "unixgram" && n != len(p)) {
+			return io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return nil
 }
 
-// Tracef logs a trace message if trace is enabled.
-func (l *SysLogger) Tracef(format string, v ...interface{}) {
-    if l.trace {
-        l.logf(l.writer.Notice, format, v...)
-    }
+// Close releases the current connection and prevents reconnection.
+func (w *SyslogWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	if w.conn.Conn == nil {
+		return nil
+	}
+	err := w.conn.Close()
+	w.conn = syslogConn{}
+	if err != nil {
+		return fmt.Errorf("logger: close syslog: %w", err)
+	}
+	return nil
 }
 
-// Close closes the syslog writer.
-func (l *SysLogger) Close() error {
-    if l.writer != nil {
-        return l.writer.Close()
-    }
-    return nil
-}
+type datagramAction uint8
+
+const (
+	datagramKeep datagramAction = iota
+	datagramSuppress
+	datagramDisconnect
+)

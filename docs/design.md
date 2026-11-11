@@ -5,7 +5,7 @@
 | Project | `github.com/ninepeach/go-logger` |
 | Target module | `github.com/ninepeach/go-logger/v2` |
 | Target release | `v2.0.0` |
-| Status | Approved implementation specification |
+| Status | Review draft — owner approval required before implementation |
 | Priorities | correctness, reliability, simplicity, performance |
 
 This document is normative. The words **MUST**, **MUST NOT**, **SHOULD**, and
@@ -68,7 +68,8 @@ native calls                    slog calls
   was accepted by the output API. It does not mean `fsync`, remote receipt, or
   survival of a process or machine crash.
 
-No library-owned background goroutine is permitted.
+No library-owned background goroutine is permitted. V2 exposes no `Sync()`
+method and does not call `File.Sync()` implicitly.
 
 ## 3. Package and public API
 
@@ -177,7 +178,7 @@ normalized. A nil output means `os.Stderr`. A nil `*Logger` passed to
 | Error handler | one-line fallback to `os.Stderr` |
 | Clock | `time.Now` |
 
-Only the seven declared levels and two declared formats are valid option
+Only the seven declared levels and two declared formats are valid native option
 values. Invalid values cause `New` or `WithLevel` to return an error. Color is
 valid only for console format; enabling it with JSON is a configuration error.
 `WithTimeFunc(nil)` and `WithErrorHandler(nil)` are configuration errors.
@@ -194,8 +195,13 @@ An event is enabled when `eventLevel >= minimumLevel` and the minimum is not
 `With()` returns a builder initialized from the logger's shared fields.
 `Context.Logger()` returns a new logger. `WithLevel` returns a new logger. They
 MUST NOT mutate the source logger. The output synchronization object, options,
-and error handler are shared. Field data is copied so caller mutation after
-`Logger()` returns cannot affect either logger.
+and error handler are shared. Primitive and byte fields are copied. `Context.Any` is serialized into an
+immutable JSON representation during `Context.Logger()`; the resulting bytes
+are owned by the derived logger, so subsequent caller mutation cannot affect it.
+Custom marshalers execute during `Context.Logger()` and their errors are returned
+there. The builder may collect `Any` values until that point; callers MUST NOT
+mutate them concurrently with `Logger()`. Existing parent snapshots are never
+re-serialized. A `Context` builder is single-use after `Logger()`.
 
 The builder records its first validation/encoding error. Later field calls are
 no-ops, and `Logger()` returns that error without producing a logger. Builders,
@@ -208,19 +214,26 @@ fields. Within each user-field section, insertion order is preserved.
 
 ### 4.1 Reserved names and conflicts
 
-At the top level, `time`, `level`, and `message` are reserved. A user field with
-one of these keys is an encoding error even when the corresponding system member
-is omitted. The empty key is allowed.
+The system members `time`, `level`, and `message` are reserved at the
+root. User attributes with these names are placed under the root `fields`
+object, rather than replacing system metadata. If any user field exists, the
+encoder emits `fields` as an object; otherwise it omits it. All native shared
+and event fields and all slog attributes share this namespace, including groups.
+This rule also permits a user field literally named `fields` inside that object.
 
-Within the same JSON object, a user key may occur only once across inherited
-and event fields. A duplicate is an encoding error. The record is not written.
-Keys may repeat in different nested slog groups because they belong to different
-objects. These rules also apply to console encoding, so switching formats cannot
-change validation behavior.
+Repeated keys within the same object use **last-write-wins**, including a
+child/event field overriding a shared field. The encoder MUST emit each key
+exactly once with the last value, retaining the position of its first insertion.
+A scalar/group conflict also uses last-write-wins: the later complete value
+replaces the earlier value; attributes that arrive subsequently under that
+group establish a new group object. Keys in distinct nested groups do not
+conflict. An empty key is allowed. A duplicate MUST NOT discard the record.
 
-For native events, a conflict is remembered at the field call and reported at
-submission. For child construction, `Context.Logger()` reports it. For slog,
-`Handle` reports it. No last-write-wins or first-write-wins behavior is allowed.
+This requires a normalized field representation before final encoding; native
+primitive field methods may append typed field entries without reflection, but
+MUST NOT emit duplicate JSON keys directly to the final output. JSON and
+Console MUST resolve conflicts identically. The system metadata remains
+independent of user fields.
 
 ### 4.2 Value representation
 
@@ -250,8 +263,10 @@ and `[]byte` produced through `Any` is replaced with U+FFFD, matching
 functions, channels, and complex values), unsupported map keys, invalid custom
 marshaler output, and non-finite floats. `Any` output is embedded as JSON in
 JSON format. In console format, scalars use normal console rules and composite
-values use compact JSON. The implementation may defer `Any` marshaling until
-submission, but MUST snapshot the resulting bytes before calling the writer.
+values use compact JSON. For `Event.Any`, marshaling occurs at submission, and its result is owned by
+the event until the synchronous write finishes. For `Context.Any`, marshaling
+occurs during `Context.Logger()` as specified in section 3.2. Custom marshalers
+are invoked exactly once per `Any` field in the relevant phase.
 Caller mutation concurrent with submission remains a caller data race.
 
 Primitive values are copied on field calls. `Bytes` copies its input on the
@@ -270,8 +285,8 @@ open -- disabled creation -------> disabled-open -- submit --> submitted
 - An enabled Event is created open. Its buffer may come from `sync.Pool`.
 - A disabled Event has no encoding buffer and never calls the clock, encoder,
   output, or error handler. Field calls are chainable no-ops.
-- The first submission atomically marks the Event submitted before encoding or
-  writing. Encoding or write failure does not make it reusable.
+- The first submission logically marks the Event submitted before encoding or
+  writing; no atomic instruction or concurrent-use guarantee is required. Encoding or write failure does not make it reusable.
 - Any field method after submission is a no-op. A second `MsgErr` or `SendErr`
   returns `ErrEventConsumed`; a second `Msg` or `Send` reports
   `ErrEventConsumed` to the error handler. Nothing is written twice.
@@ -289,7 +304,8 @@ Disabled `MsgErr` and `SendErr` return nil.
 `Msg` and `Send` call the configured error handler exactly once on an encoding,
 validation, short-write, or output error. `MsgErr` and `SendErr` return the same
 error and MUST NOT call the handler. The handler is invoked after all internal
-logger/writer locks are released. If the handler panics, that panic belongs to
+logger/writer locks are released. Custom handlers may be invoked concurrently
+from different goroutines; callers MUST provide their own synchronization. If the handler panics, that panic belongs to
 application code and is not recovered by the logger.
 
 The default handler writes a compact diagnostic directly to `os.Stderr` using a
@@ -307,6 +323,7 @@ var (
     ErrNilLogger     = errors.New("logger: nil logger")
     ErrClosed        = errors.New("logger: writer closed")
     ErrSyslogLocalUnsupported = errors.New("logger: local syslog unsupported")
+    ErrSyslogUnavailable = errors.New("logger: syslog connection unavailable")
 )
 ```
 
@@ -348,14 +365,20 @@ with reset immediately after the token. Fixed colors are trace=gray,
 debug=cyan, info=green, warn=yellow, error=red, fatal=bright red. Color is never
 auto-detected from a terminal.
 
-Nested slog groups are rendered with dotted, escaped keys (`http.method=GET`).
-A literal dot in a group or attribute name is escaped as `\.` and a literal
-backslash as `\\`, making paths unambiguous.
+Nested slog groups are flattened by escaping each path segment independently:
+replace each literal backslash with two backslashes, then each literal dot with
+backslash-dot; join escaped segments with an unescaped dot. Apply the section's
+ordinary key quoting rule **after** path escaping to the entire joined key.
+Thus segments `["http", "method"]` become `http.method`, while a single
+segment `"http.method"` becomes `http\\.method`; a segment with whitespace
+is quoted after escaping. JSON groups remain nested objects.
 
 ### 6.3 Synchronization and short writes
 
 One shared mutex in the output wrapper surrounds each complete record write for
-ordinary `io.Writer` outputs. Derived loggers share that wrapper. Thus bytes
+ordinary `io.Writer` outputs. Derived loggers share that wrapper. Two independent `New` calls given the
+same ordinary writer do NOT share a mutex: the caller MUST provide a
+concurrency-safe writer or an external synchronized wrapper. Thus bytes
 from two records cannot interleave even if the supplied writer is not safe for
 concurrent calls.
 
@@ -379,7 +402,10 @@ type FileConfig struct {
     MaxAgeDays int
     UTC        bool
     TimeFunc   func() time.Time
+    OnMaintenanceError func(error)
 }
+
+func (w *RotatingWriter) TakeMaintenanceError() error
 
 type RotatingWriter struct { /* unexported */ }
 
@@ -420,7 +446,8 @@ If either or both predicates are true, exactly one rotation attempt occurs.
 After a successful rotation, the full record is written to the new active file.
 
 `date(t)` is the Gregorian `YYYY-MM-DD` in UTC when `UTC` is true and in
-`t.Local()` otherwise. Clock movement backward is treated as a date change just
+the process's system-local location (`time.Local`) otherwise. The Location
+embedded in a custom `TimeFunc` result does not select the rotation timezone. Clock movement backward is treated as a date change just
 like movement forward; this favors deterministic boundaries over guessing.
 
 ### 7.2 Restart and active date
@@ -448,16 +475,22 @@ The active path is stable. A backup path is:
 
 where `NNNN` starts at `0001` and is at least four digits (it may grow beyond
 9999). The date describes the archived active data, not the date of the write
-that triggered rotation. Sequence allocation scans matching backups and chooses
-the lowest positive unused number. It uses an exclusive destination operation
-or an existence recheck so an existing path is never overwritten.
+that triggered rotation. Sequence allocation scans matching backups and chooses the lowest positive
+unused number. **V2 supports only a single RotatingWriter owner of a given
+active path**. All rotation and cleanup operations are serialized by that
+instance's mutex. The owner MUST NOT share its active path with another
+process, another RotatingWriter, or an external writer, and external actors
+MUST NOT create, replace, or rename managed backups while it runs.
 
-Only a suffix matching exactly `.<YYYY-MM-DD>.<positive decimal sequence>` is a
-managed backup. Lookalike files are unrelated and never cleaned up.
+The implementation checks the candidate backup path immediately before rename
+and returns a collision error if it exists. This is a single-owner contract,
+**not** an atomic no-replace guarantee against an external concurrent actor:
+`os.Rename` may replace a destination on some platforms. The library MUST NOT
+claim protection against actors that violate the ownership contract. No
+exclusive placeholder file plus ordinary `os.Rename` may be described as
+providing atomic no-replace semantics. Tests MUST verify no overwrite under
+the supported single-owner model and explicit collision detection.
 
-Multi-process use is unsupported: instances may race between name selection and
-rename. The implementation MUST detect the collision and return an error; it
-must never overwrite the other process's backup.
 
 ## 8. Rotation state machine and failure recovery
 
@@ -481,14 +514,22 @@ sequence:
 1. Reserve a non-existing backup name.
 2. Close the active descriptor. If close fails, immediately try to reopen the
    unchanged active path in append mode. Return the close error; do not rename.
-3. Rename active to backup without overwrite.
+3. Verify the selected backup path is still absent and rename active to
+   backup under the single-owner contract of section 7.3.
 4. Open a new active file with the normal flags and mode.
 5. Stat the new file, set size to its actual size (normally zero), set
-   `activeDate = date(now)`, transition to OPEN, then run retention cleanup.
+   `activeDate = date(now)`, and transition to OPEN.
+6. Write the triggering record once, updating size by the actual accepted byte
+   count; do not retry a short write.
+7. Run retention cleanup after that write, regardless of whether the write
+   succeeded. Cleanup failure is reported independently, never as a `Write`
+   error for an otherwise successful record.
 
-No triggering record is written until all five rotation steps required for OPEN
-have succeeded. Thus an error always means the caller's current record was not
-accepted by this writer.
+No triggering record is written until steps 1–5 succeed. A rotation error
+before step 6 means no bytes from the triggering record were accepted. A
+write error at step 6 may mean a partial record was accepted, as indicated by
+its returned byte count. Cleanup failures at step 7 never change the returned
+write count or error.
 
 ### 8.2 Failure matrix
 
@@ -499,12 +540,18 @@ accepted by this writer.
 | rename | reopen unchanged active append; OPEN if successful, otherwise RECOVERING |
 | new-active open after rename | rename backup back to active, then reopen append; OPEN if both succeed; otherwise RECOVERING |
 | stat new active | close it, attempt rollback as above; OPEN if rollback succeeds; otherwise RECOVERING |
-| cleanup | remain OPEN; rotation succeeded; report cleanup error and do not write triggering record |
+| cleanup | remain OPEN; preserve triggering write result and report cleanup error through the independent maintenance-error channel |
 
-Cleanup failure intentionally returns an error before writing the record, even
-though rotation succeeded, so every failure remains observable and the call has
-simple all-or-no-record semantics. The next call can write normally; cleanup is
-retried only after a later rotation.
+Retention errors MUST NOT prevent or invalidate an accepted record. The writer
+stores cleanup errors in an internal bounded maintenance-error slot (latest
+error wins). Add public `TakeMaintenanceError() error`: it atomically returns
+and clears the last pending maintenance error; nil means none. Cleanup failures
+are also reported through an optional `FileConfig.OnMaintenanceError func(error)`
+callback, invoked **after releasing the writer mutex**. The callback may run
+concurrently with other callbacks and MUST NOT call back into the same writer.
+A callback panic is application-owned. If no callback is configured, the error
+remains available via `TakeMaintenanceError`; no silent loss of observability is
+permitted. Cleanup is retried only after a later rotation.
 
 Rollback MUST NOT overwrite an active path that appeared concurrently. If a
 backup was successfully created but rollback cannot safely restore it, it stays
@@ -540,8 +587,10 @@ CLOSED; it cannot write through a descriptor being closed.
 Retention runs synchronously only after a successful rotation. The active file
 is excluded.
 
-Let `today = date(now)`. Backup age is an integer calendar-day difference
-between `today` and the date in its filename, in the configured timezone. With
+Let `today = date(now)`. Backup age is an integer Gregorian civil-date difference
+between `today` and the date in its filename, in the configured timezone.
+Calculate by civil-day ordinals, not by dividing elapsed duration by 24 hours;
+DST transitions must not change the result. With
 `MaxAgeDays = N > 0`, delete backups where `ageDays >= N`; for example, `1`
 keeps only backups dated today. Future-dated backups have age zero and are not
 age-deleted.
@@ -552,8 +601,7 @@ limits are enabled, a backup is deleted when either rule requires it.
 
 Only exact managed names for the configured base filename may be deleted.
 Deletion errors are accumulated with `errors.Join`; cleanup continues so one
-undeletable backup does not prevent handling others. See the failure matrix for
-how the aggregate is reported. Zero values mean unlimited, not zero retained.
+undeletable backup does not prevent handling others. See the independent maintenance-error reporting contract in section 8.2. Zero values mean unlimited, not zero retained.
 
 ## 10. slog compatibility
 
@@ -564,25 +612,26 @@ error handler, matching `slog.Handler`'s explicit error contract.
 
 ### 10.1 Level and record mapping
 
-| slog level | V2 level/name |
-| --- | --- |
-| `< slog.LevelDebug` | trace |
-| `slog.LevelDebug .. < slog.LevelInfo` | debug |
-| `slog.LevelInfo .. < slog.LevelWarn` | info |
-| `slog.LevelWarn .. < slog.LevelError` | warn |
-| `>= slog.LevelError` | error |
+`Enabled` MUST compare the **original integer value** of `slog.Level`
+against the configured native minimum level, without rounding or bucket
+mapping. `DisabledLevel` disables all records. `Handle` repeats this exact
+check and returns nil for disabled records. Custom slog levels between standard
+values therefore retain their precise filtering behavior.
 
-No slog level maps to fatal. `Enabled` applies this mapping and the logger
-threshold. `Handle` silently returns nil for a disabled record, as required of a
-well-behaved handler.
+For presentation, standard levels use `trace`, `debug`, `info`, `warn`,
+and `error` at their exact native values. Any other slog level is displayed
+as its signed numeric value using the canonical `slog.Level.String()`
+representation, and its original integer is retained in the normalized
+record. Slog never implicitly emits `fatal`; only native Fatal does.
 
-For enabled records, system fields use the mapped level and `Record.Message`.
-A non-zero `Record.Time` is preserved and formatted under the logger's UTC
-setting; a zero time uses the logger clock. `Record.PC` is ignored because V2
-has no source option.
+For enabled records, system fields use the original level and
+`Record.Message`. A non-zero `Record.Time` is preserved and formatted under
+the logger's UTC setting; a zero time uses the logger clock. `Record.PC` is
+ignored because V2 has no source option.
 
 Logger shared fields precede attributes stored by `WithAttrs`, which precede
-attributes in the record. Duplicate-key rules apply to the resolved structure.
+attributes in the record. Last-write-wins rules from section 4.1 apply to the
+resolved structure.
 
 ### 10.2 Attribute resolution
 
@@ -624,8 +673,8 @@ The exact semantics are:
 - Groups with no surviving attributes are omitted recursively.
 - Reserved names are forbidden only in the root object. A key such as
   `http.time` is valid because `time` is nested.
-- Duplicate keys are rejected within each resolved object, including a clash
-  between an attribute-created group and a scalar of the same name.
+- Duplicate keys and scalar/group conflicts use section 4.1's last-write-wins
+  rule within each resolved object.
 
 Console output flattens that identical tree using the escaping rule in section
 6.2. This changes presentation only, never grouping or conflict detection.
@@ -646,7 +695,8 @@ type SyslogConfig struct {
     Address  string
     Tag      string
     Facility int
-    Timeout  time.Duration
+    DialTimeout  time.Duration
+    WriteTimeout time.Duration
 }
 
 type SyslogWriter struct { /* unexported */ }
@@ -667,27 +717,51 @@ Severity mapping is trace/debug -> debug (7), info -> informational (6), warn ->
 warning (4), error -> error (3), fatal -> critical (2). Priority is
 `facility*8 + severity`.
 
-For `udp` and `tcp`, Address is required and parsed by `net.Dialer`. Timeout must
-be non-negative; zero means no library-added deadline. One connection is opened
-by the constructor and protected by a mutex. V2 does not reconnect or retry
-after write failure. TCP uses RFC 6587 octet-counting framing; UDP sends one RFC
-5424 message per datagram. Structured application fields remain in the selected
-JSON or console payload; V2 does not translate them into RFC 5424 structured
-data elements.
+For UDP and TCP, `Address` is required. `DialTimeout` and
+`WriteTimeout` MUST be non-negative. Zero means a finite default of 5 seconds
+for each. DialTimeout bounds connection establishment; WriteTimeout applies
+to **each complete message**, not each individual socket write. Set the
+connection write deadline once before sending the frame/datagram. Local Syslog
+uses the same per-message WriteTimeout where the platform supports deadlines;
+otherwise the constructor MUST reject a requested local timeout if it cannot
+enforce it. The local implementation MUST NOT silently claim bounded writes.
 
-Local Syslog uses the platform's standard local Syslog facility through
-platform-specific files. On Windows it returns `ErrSyslogLocalUnsupported` at
-construction while the package still compiles. Address must be empty for local
-and non-empty for UDP/TCP. Tag must contain printable non-space ASCII and be at
-most 48 bytes. An empty tag defaults to the executable base name. Newlines in a
-payload are escaped so one call cannot inject multiple Syslog records.
+A remote connection is opened by the constructor and protected by a mutex.
+V2 does not reconnect or retry after transport failure. TCP uses RFC 6587
+octet-counting framing; UDP sends one RFC 5424 message per datagram.
 
-`Write` follows the `io.Writer` contract. UDP success returns `len(p)` only when
-the complete datagram was accepted locally. TCP handles partial socket writes
-internally until the one frame is complete or an error occurs, because framing
-defines a recoverable byte stream; on error it returns the count of payload
-bytes known to be represented only when determinable, otherwise zero and the
-error. Close is idempotent; later writes return `ErrClosed`.
+The RFC 5424 wire message is exactly:
+`<PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG`.
+TIMESTAMP is the event time in UTC RFC3339 format; HOSTNAME is
+`os.Hostname()` or `-` on failure; APP-NAME is validated Tag (max 48
+printable non-space ASCII bytes); PROCID is the decimal `os.Getpid()`;
+MSGID and STRUCTURED-DATA are both `-`. The message body is the selected
+JSON or Console encoded record, without its trailing newline, encoded as UTF-8
+with **no BOM**. The message's embedded newlines and carriage returns are
+escaped as literal `\\n` and `\\r`. The library does not map user
+fields into RFC 5424 STRUCTURED-DATA. For TCP, prefix the byte length of the
+entire RFC 5424 message, followed by one ASCII space; the length excludes the
+prefix itself.
+
+Local Syslog uses the platform's standard local facility through
+platform-specific files. On Windows it returns `ErrSyslogLocalUnsupported`.
+Address must be empty for local and non-empty for UDP/TCP. An empty Tag
+defaults to the executable base name, then undergoes the same validation.
+
+A TCP frame write loops over partial writes until the complete frame is
+accepted or a failure occurs. If any TCP frame fails or times out, close the
+connection and permanently mark the writer BROKEN. All subsequent writes
+return `ErrSyslogUnavailable` until the caller constructs a new writer.
+A failed UDP datagram also marks the writer BROKEN, with no automatic retry.
+UDP success means only local acceptance, not remote receipt. Direct
+`Write` returns `len(p)` only on complete frame/datagram acceptance and
+returns `(0,error)` on any framing/transport failure, even if a TCP prefix
+was partially sent. This is a record-level contract, not a claim that no
+bytes reached the network. Close is idempotent; writes after Close return
+`ErrClosed`. Severity mapping remains trace/debug=7, info=6, warn=4,
+error=3, fatal=2; unknown custom slog levels use the nearest lower standard
+severity band, without changing filtering.
+
 
 For structured slog-to-Syslog use:
 
@@ -741,9 +815,9 @@ interfaces or test-only hooks, not exported production APIs.
 - disabled path: no buffer, clock, writer, or handler call;
 - `Fatal` writes without exiting;
 - all field types, insertion order, and shared/event ordering;
-- reserved, duplicate, empty, nested, and escaped keys;
+- reserved, duplicate last-write-wins, reserved-field namespace, empty, nested, and escaped keys;
 - second submission and post-submission methods;
-- child immutability and caller slice mutation;
+- child immutability, Context.Any snapshot and caller slice/map mutation;
 - JSON validity, escaping, Unicode, invalid UTF-8, and exactly one newline;
 - `Any` marshal errors, cycles, bad marshalers, and special floats;
 - console quoting, dotted-group escaping, and exact ANSI boundaries;
@@ -760,9 +834,10 @@ interfaces or test-only hooks, not exported production APIs.
 - restart with missing, empty, prior-day, same-day, and future-`mtime` files;
 - backup archived date, sequence collisions, >9999, and unrelated lookalikes;
 - each failure-matrix row, rollback success/failure, RECOVERING recovery, and
-  proof the triggering record was not written on error;
+  proof no triggering bytes were accepted on pre-write rotation failure;
 - partial writes with size reconciliation;
-- age-only, count-only, combined, future-date, and deletion-error retention;
+- age-only, count-only, combined, future-date, DST, and deletion-error retention;
+- cleanup failure does not reject an accepted record; maintenance-error retrieval and callback;
 - concurrent writes, Write/Close races, idempotent Close, and write after close.
 
 ### slog and Syslog
@@ -770,9 +845,10 @@ interfaces or test-only hooks, not exported production APIs.
 - all `slog.Handler` methods and immutable derivation;
 - `WithAttrs` before/after groups, nested/empty/inline groups, scalar/group
   conflicts, `LogValuer`, resolution errors, and record time;
-- Syslog priority/facility mapping and exact UDP/TCP framing;
+- Syslog priority/facility mapping and exact RFC 5424 UDP/RFC 6587 TCP framing;
 - local supported/unsupported builds, bad config, timeout, partial TCP write,
-  connection failure, newline injection defense, and Close.
+  connection failure, broken TCP stream after partial frame, bounded timeouts,
+  newline injection defense, and Close.
 
 The following must pass:
 
@@ -780,9 +856,9 @@ The following must pass:
 go test ./...
 go test -race ./...
 go vet ./...
-GOOS=linux go test ./...
-GOOS=darwin go test ./...
-GOOS=windows go test ./...
+GOOS=linux GOARCH=amd64 go test -exec=true ./... # compile-only; use CI runners to execute
+GOOS=darwin GOARCH=arm64 go test -exec=true ./... # compile-only
+GOOS=windows GOARCH=amd64 go test -exec=true ./... # compile-only
 ```
 
 Cross-OS commands may be compile-only where binaries cannot run on the host.
@@ -802,9 +878,10 @@ V2 is acceptable only when all of the following are true:
 6. JSON success always produces valid JSON Lines; console output meets its exact
    quoting and color rules.
 7. Rotation failures leave OPEN, RECOVERING, or CLOSED state exactly as defined,
-   never overwrite backups, and never claim the current record succeeded.
+   never overwrite backups under the single-owner contract, and never claim the
+   current record succeeded when its write failed.
 8. Restart daily rotation, retention calendar age, slog grouping, field
-   conflicts, close ownership, and Windows behavior have explicit passing tests.
+   conflict resolution, close ownership, and Windows behavior have explicit passing tests.
 9. Benchmarks and their environment are recorded for review; optimization has
    not weakened correctness.
 10. README, migration guide, and V2 examples are updated before tagging

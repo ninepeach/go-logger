@@ -202,9 +202,11 @@ Custom marshalers execute during `Context.Logger()`. Each failed field is
 snapshotted as JSON `null`, while other fields are preserved. `Logger()` MUST
 return the usable derived logger together with an error wrapping
 `ErrFieldEncoding`; multiple failures are combined using `errors.Join`.
-The caller MAY use the returned logger despite the non-nil error. Only a
-non-field-encoding configuration/invariant failure may return a nil logger;
-ordinary field encoding failures MUST NOT do so. The builder may collect
+The caller MAY use the returned logger despite the non-nil error. Ordinary field encoding failures MUST NOT return a nil logger. Calling
+`Logger()` a second time on the same builder MUST return
+`(nil, ErrEventConsumed)` without re-running marshalers or modifying the
+previously returned logger; this is the only defined nil-logger outcome for a
+valid builder. The builder may collect
 `Any` values until `Logger()`; callers MUST NOT mutate them concurrently with
 that call. Existing parent snapshots are never re-serialized. A `Context`
 builder is single-use after `Logger()` and is not goroutine-safe. Field
@@ -263,8 +265,8 @@ value's location otherwise. Invalid UTF-8 in keys, strings, messages, errors,
 and `[]byte` produced through `Any` is replaced with U+FFFD, matching
 `encoding/json`; raw `Bytes` is Base64 and therefore unaffected.
 
-`Err(nil)` adds nothing. A non-nil `Err` uses the key `error` and the
-string returned by `Error()` for conflict detection. Calling `Error()` MUST
+`Err(nil)` adds nothing. A non-nil `Err` is equivalent to a string field with key `error`;
+conflict detection depends only on that key, not the result of `Error()`. Calling `Error()` MUST
 be panic-safe, including for typed-nil errors: a panic degrades that field to
 `null` and produces `ErrFieldEncoding` rather than crashing the logger.
 
@@ -272,7 +274,9 @@ be panic-safe, including for typed-nil errors: a panic degrades that field to
 `encoding.TextMarshaler`. Cycles, unsupported values (including functions,
 channels, complex values, and map keys), invalid custom marshaler output,
 and non-finite floats cause field-level degradation, not record rejection.
-A failed field is replaced with JSON `null` (console text `null`), and an
+A failed field is replaced with JSON `null` (console text `null`; the
+console representation intentionally cannot distinguish this from an ordinary
+string field whose displayed value is `null`), and an
 error wrapping `ErrFieldEncoding` identifies the field path and underlying
 cause without exposing its value. This preserves valid JSON but does not
 guarantee compatibility with every downstream schema. Panics from custom
@@ -332,8 +336,13 @@ from different goroutines; callers MUST provide their own synchronization. If th
 application code and is not recovered by the logger.
 
 The default handler writes a compact diagnostic directly to `os.Stderr` using a
-private mutex and does not call this package recursively. Failure of that
-fallback write is ignored because there is no further safe reporting channel.
+private mutex and does not call this package recursively. It MUST emit at most
+one diagnostic per one-second interval, using monotonic elapsed time, and count
+suppressed errors. The next emitted diagnostic MUST include the number of
+errors suppressed since the previous emission; suppressed errors do not invoke
+additional output. The rate-limit state is shared by loggers using the same
+default handler, and is safe for concurrent calls. Failure of the fallback
+write is ignored because there is no further safe reporting channel.
 
 The package exposes sentinel errors usable with `errors.Is`:
 
@@ -685,10 +694,15 @@ resolved structure.
 
 ### 10.2 Attribute resolution
 
-- Resolve `slog.LogValuer` repeatedly until the value is not `KindLogValuer`,
-  with the same recursion guard behavior as `slog`'s reference handlers.
-- A resolution error becomes a string value under the original key, following
-  standard slog handler behavior, rather than panicking.
+- Resolve `slog.LogValuer` by calling `LogValue()` directly in a bounded
+  resolution loop with a fixed internal recursion limit. MUST NOT use
+  `slog.Value.Resolve()`, because it converts panics into ordinary error values
+  that cannot reliably be distinguished from intentionally returned errors.
+- Recover a `LogValue()` panic at the field boundary. A panic or resolution
+  limit exhaustion MUST degrade only the affected field to `null`, wrap
+  `ErrFieldEncoding`, and preserve other fields and the record. A normally
+  returned error value is an ordinary value, not a resolution failure.
+  Diagnostics MUST NOT embed panic stacks or arbitrary field contents.
 - `KindTime` and `KindDuration` use the native representations in section 4.
 - `KindAny` uses native `Any` semantics.
 - An empty attribute (`key == ""` and zero value) is discarded.
@@ -869,6 +883,8 @@ interfaces or test-only hooks, not exported production APIs.
 - reserved, duplicate last-write-wins, reserved-field namespace, empty, nested, and escaped keys;
 - second submission and post-submission methods;
 - child immutability, Context.Any snapshot and caller slice/map mutation;
+- Context.Logger second invocation returns `(nil, ErrEventConsumed)` without
+  repeating marshalers; first invocation can return usable logger plus error;
 - JSON validity, escaping, Unicode, invalid UTF-8, and exactly one newline;
 - `Any` field-level degradation, cycles, bad marshalers including panics,
   special floats, typed-nil `Err` panics, `ErrFieldEncoding`, `errors.Join`,
@@ -876,6 +892,8 @@ interfaces or test-only hooks, not exported production APIs.
   with usable non-nil Logger and non-nil error;
 - console quoting, dotted-group escaping, and exact ANSI boundaries;
 - short writes and error handler exactly-once/non-recursion behavior;
+- default Logger error handler one-second rate limit, suppression counts,
+  and concurrent calls; console degraded-null presentation ambiguity;
 - concurrent derived loggers sharing an intentionally unsafe writer.
 
 ### RotatingWriter and retention
@@ -905,7 +923,8 @@ interfaces or test-only hooks, not exported production APIs.
   exactly-once reporting and retained Handle return errors; custom-level
   lowercase presentation;
 - `WithAttrs` before/after groups, nested/empty/inline groups, scalar/group
-  conflicts, `LogValuer`, resolution errors, and record time;
+  conflicts, direct `LogValuer` resolution, panic, recursion exhaustion,
+  ordinary error values, and record time;
 - Syslog priority/facility mapping and exact RFC 5424 UDP/RFC 6587 TCP framing;
 - local supported/unsupported builds, bad config, timeout, partial TCP write,
   connection failure, broken TCP stream after partial frame, bounded timeouts,

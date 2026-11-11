@@ -13,7 +13,7 @@ go get github.com/ninepeach/go-logger/v2
 To try a local V2 checkout from an application module, point the dependency at that checkout:
 
 ```sh
-go mod edit -require=github.com/ninepeach/go-logger/v2@v2.0.0
+go mod edit -require=github.com/ninepeach/go-logger/v2@v2.0.1
 go mod edit -replace=github.com/ninepeach/go-logger/v2=/path/to/go-logger
 ```
 

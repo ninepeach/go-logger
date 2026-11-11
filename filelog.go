@@ -73,9 +73,7 @@ func NewRotatingWriter(cfg FileConfig) (*RotatingWriter, error) {
 	}
 	cfg.Filename = path
 	w := &RotatingWriter{cfg: cfg, mono: time.Now, ops: fileOps{
-		open: func(path string, flags int, mode fs.FileMode) (activeFile, error) {
-			return os.OpenFile(path, flags, mode)
-		},
+		open:   openActiveFile,
 		rename: os.Rename, link: os.Link, remove: os.Remove, lstat: os.Lstat, readDir: os.ReadDir,
 	}}
 	now, err := w.dateNow()
@@ -113,6 +111,29 @@ func (w *RotatingWriter) reopen(today string, inferDate bool) error {
 	if err != nil {
 		return fmt.Errorf("logger: stat active: %w", errors.Join(err, f.Close()))
 	}
+
+	if !info.Mode().IsRegular() {
+		return errors.Join(
+			fmt.Errorf("logger: active file is not a regular file: %w", ErrInvalidConfig),
+			f.Close(),
+		)
+	}
+
+	pathInfo, err := w.ops.lstat(w.cfg.Filename)
+	if err != nil {
+		return errors.Join(
+			fmt.Errorf("logger: inspect active path: %w", err),
+			f.Close(),
+		)
+	}
+
+	if !pathInfo.Mode().IsRegular() || !os.SameFile(info, pathInfo) {
+		return errors.Join(
+			fmt.Errorf("logger: active path identity mismatch: %w", fs.ErrExist),
+			f.Close(),
+		)
+	}
+
 	w.file, w.size = f, info.Size()
 	if inferDate {
 		w.activeDate = today
@@ -235,12 +256,45 @@ func (w *RotatingWriter) rotate(today string) error {
 		return errors.Join(fmt.Errorf("logger: create new active: %w", err), w.rollback(backup, today))
 	}
 	created, identityErr := w.ops.lstat(w.cfg.Filename)
-	info, err := f.Stat()
-	if err != nil || identityErr != nil {
+	info, statErr := f.Stat()
+
+	var checkErr error
+
+	switch {
+	case statErr != nil || identityErr != nil:
+		checkErr = errors.Join(statErr, identityErr)
+
+	case !info.Mode().IsRegular():
+		checkErr = fmt.Errorf(
+			"logger: new active file is not regular: %w",
+			ErrInvalidConfig,
+		)
+
+	case !created.Mode().IsRegular():
+		checkErr = fmt.Errorf(
+			"logger: new active path is not regular: %w",
+			ErrInvalidConfig,
+		)
+
+	case !os.SameFile(created, info):
+		checkErr = fmt.Errorf(
+			"logger: new active file identity mismatch: %w",
+			fs.ErrExist,
+		)
+	}
+
+	if checkErr != nil {
 		closeErr := f.Close()
 		removeErr := w.removeCreated(created)
-		return errors.Join(fmt.Errorf("logger: stat new active: %w", errors.Join(err, identityErr)), closeErr, removeErr, w.rollback(backup, today))
+
+		return errors.Join(
+			fmt.Errorf("logger: validate new active: %w", checkErr),
+			closeErr,
+			removeErr,
+			w.rollback(backup, today),
+		)
 	}
+
 	w.file, w.size, w.activeDate = f, info.Size(), today
 	return nil
 }

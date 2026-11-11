@@ -1,3 +1,5 @@
 module github.com/ninepeach/go-logger/v2
 
 go 1.25.1
+
+require golang.org/x/sys v0.38.0

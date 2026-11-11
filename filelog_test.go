@@ -237,3 +237,54 @@ func TestRetentionAndSequence(t *testing.T) {
 		t.Fatal(names)
 	}
 }
+
+func TestRotatingWriterRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+
+	target := filepath.Join(dir, "target")
+	active := filepath.Join(dir, "active")
+
+	if err := os.WriteFile(target, []byte("original"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Symlink(target, active); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	w, err := NewRotatingWriter(FileConfig{
+		Filename: active,
+	})
+
+	if err == nil {
+		_ = w.Close()
+		t.Fatal("expected symlink rejection")
+	}
+
+	if got := readFile(t, target); got != "original" {
+		t.Fatalf("target modified: %q", got)
+	}
+}
+
+func TestRotatingWriterAppendExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "active")
+
+	if err := os.WriteFile(path, []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := NewRotatingWriter(FileConfig{Filename: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeRecord(t, w, "new")
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := readFile(t, path); got != "oldnew" {
+		t.Fatalf("unexpected content: %q", got)
+	}
+}

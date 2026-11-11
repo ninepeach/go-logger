@@ -194,6 +194,9 @@ func (l *Logger) Enabled(level Level) bool { return l.enabled(int(level)) }
 
 // WithLevel derives a logger with a new minimum level.
 func (l *Logger) WithLevel(level Level) (*Logger, error) {
+	if l == nil {
+		return nil, ErrNilLogger
+	}
 	derived := *l
 	if err := WithLevel(level)(&derived.config); err != nil {
 		return nil, err

@@ -206,3 +206,15 @@ func TestSharedWriterConcurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestNilLoggerWithLevel(t *testing.T) {
+	var l *Logger
+
+	derived, err := l.WithLevel(InfoLevel)
+	if !errors.Is(err, ErrNilLogger) {
+		t.Fatalf("expected ErrNilLogger, got %v", err)
+	}
+	if derived != nil {
+		t.Fatal("expected nil derived logger")
+	}
+}
